@@ -640,6 +640,12 @@ _thread.join()
 
 if 'error' in _result:
     st.error(f'Failed to load data: {_result["error"]}')
+    import traceback
+    st.exception(_result['error'])
+    st.stop()
+
+if 'data' not in _result:
+    st.error('Data load completed but returned no result. Check logs.')
     st.stop()
 
 lb, pools = _result['data']
