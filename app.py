@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import asyncio
+import subprocess
 from datetime import date, datetime
 from itertools import combinations
 
@@ -479,10 +480,36 @@ async def _render_jpg(html: str) -> bytes:
     return img_bytes
 
 
+def install_chromium():
+    try:
+        subprocess.run(
+            [sys.executable, '-m', 'playwright', 'install', 'chromium'],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return True
+    except Exception as exc:
+        raise RuntimeError(
+            'Failed to install Chromium automatically. '
+            'Please install it manually with `playwright install chromium`.'
+        ) from exc
+
+
 def render_card(html: str) -> bytes:
     try:
         return asyncio.run(_render_jpg(html))
     except Exception as e:
+        err_text = str(e).lower()
+        if 'chromium' in err_text or 'browser' in err_text or 'playwright' in err_text:
+            try:
+                install_chromium()
+                return asyncio.run(_render_jpg(html))
+            except Exception as install_err:
+                raise RuntimeError(
+                    'Playwright is installed but Chromium could not be installed. '
+                    'Please ensure the environment allows `playwright install chromium`.'
+                ) from install_err
         raise RuntimeError(
             'Playwright render failed. Ensure Playwright and Chromium are installed: '
             '`pip install playwright && playwright install chromium`'
