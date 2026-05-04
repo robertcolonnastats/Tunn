@@ -13,12 +13,19 @@ import os
 import sys
 import asyncio
 import subprocess
-import shutil
 import tempfile
 from datetime import date, datetime
 from itertools import combinations
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# ── Set Playwright browser path before any playwright import ──────────────────
+# Streamlit Cloud wipes ~/.cache on each cold boot. We redirect the browser
+# binary to /tmp which persists within a session and is writable by appuser.
+import tempfile as _tmpfile
+_BROWSERS_PATH = os.path.join(_tmpfile.gettempdir(), 'ms-playwright-browsers')
+os.environ['PLAYWRIGHT_BROWSERS_PATH'] = _BROWSERS_PATH
+os.makedirs(_BROWSERS_PATH, exist_ok=True)
 
 # ── Import V18 pipeline ───────────────────────────────────────────────────────
 try:
@@ -469,20 +476,43 @@ def make_card_html(info):
 <script>{js}</script></body></html>"""
 
 
-def find_chromium_executable() -> str | None:
-    candidates = ['chromium', 'chromium-browser', 'google-chrome-stable']
-    for name in candidates:
-        path = shutil.which(name)
+def find_chromium_executable():
+    """Check for a system Chromium before using Playwright's bundled one."""
+    import shutil as _shutil
+    for name in ['chromium', 'chromium-browser', 'google-chrome-stable', 'google-chrome']:
+        path = _shutil.which(name)
         if path:
             return path
     return None
+
+
+def install_chromium():
+    """Install Playwright Chromium into PLAYWRIGHT_BROWSERS_PATH."""
+    # PLAYWRIGHT_BROWSERS_PATH is already set at module load time.
+    # Just run the install — it will use the env var automatically.
+    proc = subprocess.run(
+        [sys.executable, '-m', 'playwright', 'install', 'chromium'],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=os.environ.copy(),
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            'Failed to install Chromium automatically.\n'
+            f'{proc.stdout}\n{proc.stderr}'
+        )
 
 
 async def _render_jpg(html: str) -> bytes:
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         chromium_exec = find_chromium_executable()
-        launch_kwargs = {'headless': True, 'args': ['--no-sandbox', '--disable-dev-shm-usage']}
+        launch_kwargs = {
+            'headless': True,
+            'args': ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+        }
         if chromium_exec:
             launch_kwargs['executable_path'] = chromium_exec
         browser = await p.chromium.launch(**launch_kwargs)
@@ -495,45 +525,29 @@ async def _render_jpg(html: str) -> bytes:
     return img_bytes
 
 
-def install_chromium() -> bool:
-    env = os.environ.copy()
-    env['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(tempfile.gettempdir(), 'ms-playwright-browsers')
-
-    proc = subprocess.run(
-        [sys.executable, '-m', 'playwright', 'install', 'chromium'],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            'Failed to install Chromium automatically. Command output:\n'
-            f'{proc.stdout}\n{proc.stderr}'
-        )
-    return True
-
-
 def render_card(html: str) -> bytes:
+    # PLAYWRIGHT_BROWSERS_PATH is set at module load — no need to repeat here.
     try:
         return asyncio.run(_render_jpg(html))
     except Exception as e:
         err_text = str(e).lower()
-        if 'chromium' in err_text or 'browser' in err_text or 'playwright' in err_text:
+        if any(k in err_text for k in ('chromium', 'browser', 'playwright',
+                                        "doesn't exist", 'executable')):
             try:
                 install_chromium()
                 return asyncio.run(_render_jpg(html))
             except Exception as install_err:
                 raise RuntimeError(
                     'Playwright is installed but Chromium could not be installed. '
-                    'Please ensure the environment allows `playwright install chromium`. '
-                    f'Install output:\n{install_err}'
+                    'Please ensure the environment allows `playwright install chromium`.\n'
+                    f'{install_err}'
                 ) from install_err
         raise RuntimeError(
             'Playwright render failed. Ensure Playwright and Chromium are installed: '
             '`pip install playwright && playwright install chromium`'
         ) from e
+
+
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -592,12 +606,43 @@ def get_league_pools(start: str, end: str):
     _, df_raw = load_season_data(start, end)
     return build_league_pools(df_raw)
 
-with st.spinner('Loading Statcast data… (first load ~2–3 min)'):
+# Run the Statcast pull in a background thread while the main thread
+# sends periodic status updates to keep the websocket alive.
+# Streamlit Cloud drops the connection after ~90s of silence — a full
+# season pull takes 2-4 min, so we need to keep pinging.
+import threading, time as _time
+
+_result   = {}
+_progress = st.empty()
+
+def _load_in_background():
     try:
-        lb, pools = load_season_data(start_str, end_str)
-    except Exception as e:
-        st.error(f'Failed to load data: {e}')
-        st.stop()
+        _result['data'] = load_season_data(start_str, end_str)
+    except Exception as exc:
+        _result['error'] = exc
+
+_thread = threading.Thread(target=_load_in_background, daemon=True)
+_thread.start()
+
+_dots = 0
+_start_t = _time.time()
+while _thread.is_alive():
+    _elapsed = int(_time.time() - _start_t)
+    _dots = (_dots + 1) % 4
+    _progress.info(
+        f'⏳ Loading Statcast data{"." * _dots}  '
+        f'({_elapsed}s — full season pull takes 2–3 min)'
+    )
+    _time.sleep(3)
+
+_progress.empty()
+_thread.join()
+
+if 'error' in _result:
+    st.error(f'Failed to load data: {_result["error"]}')
+    st.stop()
+
+lb, pools = _result['data']
 
 # Filter and rerank
 lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
@@ -617,8 +662,8 @@ st.success(
 )
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(
-    ['📊 Leaderboard', '🃏 Player Card', '📥 Export', '🔬 Diagnostic']
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ['📊 Leaderboard', '🃏 Player Card', '📥 Export', '🔬 Diagnostic', '📖 Methodology']
 )
 
 # ─── Tab 1: Leaderboard ───────────────────────────────────────────────────────
@@ -658,7 +703,7 @@ with tab1:
     disp = display[show_cols].rename(columns=col_names)
     st.dataframe(
         disp,
-        width='stretch',
+        use_container_width=True,
         hide_index=True,
         column_config={
             'Rank':      st.column_config.NumberColumn(width='small'),
@@ -693,7 +738,7 @@ with tab2:
 
         if not playwright_ok:
             st.warning(
-                'Playwright not installed — showing text card only. '
+                'Playwright or Chromium not available — showing text card only. '
                 'Run `pip install playwright && playwright install chromium` for JPG cards.'
             )
             tp  = lb_row['tunneling_plus']
@@ -709,7 +754,7 @@ with tab2:
                 adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
                                           'ivb':'IVB','hb':'HB','frac':'Usage%'})
                 cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
-                st.dataframe(adf[cols], width='stretch', hide_index=True)
+                st.dataframe(adf[cols], use_container_width=True, hide_index=True)
         else:
             with st.spinner(f'Rendering card for {selected}…'):
                 try:
@@ -720,7 +765,7 @@ with tab2:
                     else:
                         html      = make_card_html(info)
                         jpg_bytes = render_card(html)
-                        st.image(jpg_bytes, width=720)
+                        st.image(jpg_bytes, use_container_width=False, width=720)
                         slug = selected.lower().replace(' ', '_').replace('.', '')
                         st.download_button(
                             label='⬇️ Download card JPG',
@@ -729,11 +774,6 @@ with tab2:
                             mime='image/jpeg'
                         )
                 except Exception as e:
-                    if 'chromium' in str(e).lower() or 'playwright' in str(e).lower():
-                        st.warning(
-                            'Playwright is installed but Chromium is not available. '
-                            'Run `playwright install chromium` for JPG cards.'
-                        )
                     st.error(f'Card render failed: {e}')
                     st.exception(e)
 
@@ -783,7 +823,7 @@ with tab4:
         except Exception:
             pass
 
-    st.dataframe(diag_df.round(4), width='stretch', hide_index=True)
+    st.dataframe(diag_df.round(4), use_container_width=True, hide_index=True)
 
     csv_bytes = diag_df.round(4).to_csv(index=False).encode()
     st.download_button(
@@ -795,4 +835,140 @@ with tab4:
     st.caption(
         'release_side = release_pos_x + (0.3655×ext − 2.4608). '
         'hb: RHP = pfx_x×12, LHP = pfx_x×12×−1. All pitches, no windup filter.'
+    )
+
+# ─── Tab 5: Methodology ───────────────────────────────────────────────────────
+with tab5:
+    st.markdown("## Tunneling+ — Model Methodology")
+    st.caption(f"v18 · Statcast Edition · {start_str} to {end_str}")
+
+    st.markdown("---")
+    st.markdown("### What is Tunneling+?")
+    st.markdown(
+        "Tunneling+ measures how well a pitcher disguises his pitches through the "
+        "**tunnel point** — the moment roughly 23.8 ft from the plate where a hitter "
+        "must commit to swing or take. Pitches that look identical at the tunnel point "
+        "but diverge dramatically by the plate are the hardest to read. "
+        "Normalized within handedness: 100 = league average, 1 SD approx 15 points, "
+        "winsorized to [60, 160]."
+    )
+
+    st.markdown("---")
+    st.markdown("### Pair Classification")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.markdown("**Tunnel pair**")
+        st.markdown(
+            "Tunnel distance < 6.6 inches (league p50) "
+            "AND plate divergence ratio > 1.5x. "
+            "Pitches that converge at the commit point then break sharply apart."
+        )
+    with col_b:
+        st.markdown("**Speed-change pair**")
+        st.markdown(
+            "Plate distance < 14.9 inches (league p33) "
+            "AND velocity gap > 6.8 mph (league p50). "
+            "Same location, different speed — hitter commits before detecting the difference."
+        )
+    with col_c:
+        st.markdown("**Irrelevant pair**")
+        st.markdown(
+            "Neither condition met. Excluded for pitchers with at least one qualifying pair. "
+            "Pitchers with only irrelevant pairs are scored on raw metrics and "
+            "flagged 'Unclassified pairs.'"
+        )
+
+    st.markdown("---")
+    st.markdown("### Tunnel Composite Score")
+    st.markdown(
+        "Qualifying tunnel pairs are weighted by **usage x tunnel ratio** — "
+        "higher weight to elite, frequently-thrown pairs. "
+        "The composite is a weighted average of five components:"
+    )
+    components = [
+        ("35%", "Tunnel Ratio (TR)",
+         "Plate spread divided by tunnel distance. Primary signal — how much the pitch "
+         "breaks after the commit point relative to how tight it looks at the tunnel point."),
+        ("20%", "Break:Tunnel Ratio (BTR)",
+         "Additional plate spread beyond the tunnel distance. "
+         "Rewards pitches that break more than they tunnel."),
+        ("15%", "Interaction Index (IX)",
+         "Axis alignment combined with plate divergence. Rewards pitches that tunnel "
+         "on-axis but diverge sharply at the plate."),
+        ("15%", "Release:Tunnel Ratio (RTR) — inverted",
+         "Release spread relative to tunnel distance. Lower is better — a consistent "
+         "release slot hiding different pitches scores higher."),
+        ("10%", "Late Break Multiplier (LBM)",
+         "Rewards pitches with break concentrated after the tunnel point "
+         "rather than early in flight."),
+        ("5%",  "Velocity Differential (VD)",
+         "Absolute velocity gap between paired pitches. Modest contribution — "
+         "speed difference adds deception on top of movement."),
+    ]
+    for pct, name, desc in components:
+        st.markdown(f"**{pct} — {name}:** {desc}")
+        st.markdown("")
+
+    st.markdown("---")
+    st.markdown("### Final Composite and Normalization")
+    st.markdown(
+        "Final score = **80% tunnel composite + 20% temporal** (speed-change deception). "
+        "Both components are z-scored within handedness before combining, so RHP and LHP "
+        "are evaluated against their own peers. Converted to a 100-point scale "
+        "(mean=100, std approx 15), winsorized to [60, 160]. "
+        "Minimum 10 pitches per pitch type and 50 total pitches to qualify."
+    )
+
+    st.markdown("---")
+    st.markdown("### Data and Calibration")
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        st.markdown("**Source**")
+        st.markdown(
+            "Baseball Savant (Statcast) via pybaseball. "
+            "All pitches included — no runner or windup filter. "
+            "Data cached for 1 hour per date range."
+        )
+        st.markdown("**hb sign convention**")
+        st.markdown(
+            "Positive hb = arm side for that pitcher. "
+            "RHP: pfx_x x 12 x -1. "
+            "LHP: pfx_x x 12 (no flip). "
+            "Converts Statcast catcher-relative coordinates to pitcher-relative arm-side convention."
+        )
+    with cc2:
+        st.markdown("**release_side correction**")
+        st.markdown(
+            "release_side = release_pos_x + (0.3655 x extension - 2.4608). "
+            "Extension-based correction fitted from diagnostic comparison of "
+            "Statcast release_pos_x vs TJ Stats reference frame. "
+            "Reduces mean offset to under 0.03 ft per pitch type."
+        )
+        st.markdown("**Known limitation**")
+        st.markdown(
+            "Statcast release_pos_x has less within-pitcher spread across pitch types "
+            "than TJ Stats release_side (avg 0.24 ft vs 0.33 ft). "
+            "This produces a Statcast-native calibration that differs from the "
+            "TJ Stats-based V17 output."
+        )
+
+    st.markdown("---")
+    st.markdown("### Model Constants")
+    const_data = {
+        "Tunnel point": "23.8 ft from plate",
+        "Tunnel threshold": "6.6 in (league p50 tunnel distance)",
+        "Min tunnel ratio": "1.5x",
+        "Speed-change plate threshold": "14.9 in (league p33)",
+        "Speed-change velo threshold": "6.8 mph (league p50)",
+        "League avg plate distance": "20.07 in",
+        "Min pitches per pitch type": "10",
+        "Min total pitches to qualify": "50",
+        "Score range": "60 to 160 (winsorized)",
+        "Normalization": "Within handedness, mean=100, std approx 15",
+    }
+    for k, v in const_data.items():
+        st.markdown(f"- **{k}:** {v}")
+
+    st.markdown("---")
+    st.caption("Tunneling+ v18 · By Robert Colonna · Built on Statcast via pybaseball")
     )
