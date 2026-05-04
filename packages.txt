@@ -1,0 +1,21 @@
+# System packages for Playwright/Chromium
+libatk-bridge2.0-0
+libatk1.0-0
+libdrm2
+libxcomposite1
+libxdamage1
+libxrandr2
+libgbm1
+libxss1
+libasound2
+libgtk-3-0
+libx11-xcb1
+libxcb-dri3-0
+libxcb-shm0
+libxcb-xfixes0
+libxfixes3
+libxext6
+libx11-6
+libxcb1
+libxau6
+libxdmcp6
