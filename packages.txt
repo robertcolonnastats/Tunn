@@ -18,3 +18,4 @@ libx11-6
 libxcb1
 libxau6
 libxdmcp6
+chromium

@@ -13,6 +13,8 @@ import os
 import sys
 import asyncio
 import subprocess
+import shutil
+import tempfile
 from datetime import date, datetime
 from itertools import combinations
 
@@ -467,10 +469,23 @@ def make_card_html(info):
 <script>{js}</script></body></html>"""
 
 
+def find_chromium_executable() -> str | None:
+    candidates = ['chromium', 'chromium-browser', 'google-chrome-stable']
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
 async def _render_jpg(html: str) -> bytes:
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
+        chromium_exec = find_chromium_executable()
+        launch_kwargs = {'headless': True, 'args': ['--no-sandbox', '--disable-dev-shm-usage']}
+        if chromium_exec:
+            launch_kwargs['executable_path'] = chromium_exec
+        browser = await p.chromium.launch(**launch_kwargs)
         page    = await browser.new_page(viewport={'width': 760, 'height': 2000})
         await page.set_content(html)
         await page.wait_for_timeout(800)
@@ -480,20 +495,24 @@ async def _render_jpg(html: str) -> bytes:
     return img_bytes
 
 
-def install_chromium():
-    try:
-        subprocess.run(
-            [sys.executable, '-m', 'playwright', 'install', 'chromium'],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return True
-    except Exception as exc:
+def install_chromium() -> bool:
+    env = os.environ.copy()
+    env['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(tempfile.gettempdir(), 'ms-playwright-browsers')
+
+    proc = subprocess.run(
+        [sys.executable, '-m', 'playwright', 'install', 'chromium'],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+    )
+    if proc.returncode != 0:
         raise RuntimeError(
-            'Failed to install Chromium automatically. '
-            'Please install it manually with `playwright install chromium`.'
-        ) from exc
+            'Failed to install Chromium automatically. Command output:\n'
+            f'{proc.stdout}\n{proc.stderr}'
+        )
+    return True
 
 
 def render_card(html: str) -> bytes:
@@ -508,7 +527,8 @@ def render_card(html: str) -> bytes:
             except Exception as install_err:
                 raise RuntimeError(
                     'Playwright is installed but Chromium could not be installed. '
-                    'Please ensure the environment allows `playwright install chromium`.'
+                    'Please ensure the environment allows `playwright install chromium`. '
+                    f'Install output:\n{install_err}'
                 ) from install_err
         raise RuntimeError(
             'Playwright render failed. Ensure Playwright and Chromium are installed: '
