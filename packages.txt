@@ -1,4 +1,3 @@
-# System packages for Playwright/Chromium
 libatk-bridge2.0-0
 libatk1.0-0
 libdrm2
