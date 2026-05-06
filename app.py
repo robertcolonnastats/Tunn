@@ -585,7 +585,7 @@ with st.sidebar:
     )
     st.markdown('---')
 
-    season = st.selectbox('Season', [2026, 2025, 2024, 2023, 2022, 2021], index=0)
+    season = 2026  # locked to 2026 — multi-season switching caused OOM crashes
 
     st.markdown('**Date range**')
     col_d1, col_d2 = st.columns(2)
@@ -635,7 +635,7 @@ def _load_season_data_direct(start: str, end: str):
         'pitch_type', 'pitches',
         'velo', 'ivb', 'hb',
         'tunnel_x', 'tunnel_z', 'plate_x', 'plate_z',
-        'extension', 'release_height', 'release_side',
+        'extension', 'release_height', 'release_side', 'rel_x', 'rel_z',
     ]
     _keep = [col for col in _POOLS_COLS if col in df_raw.columns]
     pools = df_raw[_keep].copy()
