@@ -626,10 +626,21 @@ def _load_season_data_direct(start: str, end: str):
     df_raw = load_statcast(start, end, verbose=False)
     c, f   = run_model(df_raw)
     q      = normalize(c, f)
-    # pools = df_raw — downstream code expects a DataFrame with pitcher_name,
-    # pitch_type, pitches, tunnel_x/z, plate_x/z, etc. (aggregated per pitcher/type).
-    # f (second return of run_model) is NOT a DataFrame — do not use it as pools.
-    return q, df_raw
+    # Trim df_raw to only the columns downstream code actually needs.
+    # This dramatically reduces RAM — the full df_raw may have dozens of extra
+    # Statcast columns never used after this point. Freeing it before storing
+    # prevents OOM crashes when switching seasons.
+    _POOLS_COLS = [
+        'pitcher_id', 'pitcher_name', 'pitcher_team', 'hand',
+        'pitch_type', 'pitches',
+        'velo', 'ivb', 'hb',
+        'tunnel_x', 'tunnel_z', 'plate_x', 'plate_z',
+        'extension', 'release_height', 'release_side',
+    ]
+    _keep = [col for col in _POOLS_COLS if col in df_raw.columns]
+    pools = df_raw[_keep].copy()
+    del df_raw  # free the full table immediately
+    return q, pools
 
 # Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
 @st.cache_data(ttl=21600, show_spinner=False)
