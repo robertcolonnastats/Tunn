@@ -606,47 +606,49 @@ def get_league_pools(start: str, end: str):
     _, df_raw = load_season_data(start, end)
     return build_league_pools(df_raw)
 
-# Use session_state + st.rerun() to poll for completion without
-# blocking the main thread with time.sleep() — blocking the main thread
-# kills the websocket keepalive on Streamlit Cloud.
+# Run the Statcast pull in a background thread while the main thread
+# sends periodic status updates to keep the websocket alive.
+# Streamlit Cloud drops the connection after ~90s of silence — a full
+# season pull takes 2-4 min, so we need to keep pinging.
 import threading, time as _time
 
-_cache_key = f'data_{start_str}_{end_str}'
-_err_key   = f'err_{start_str}_{end_str}'
-_thread_key = f'thread_{start_str}_{end_str}'
-_t0_key    = f't0_{start_str}_{end_str}'
+_result   = {}
+_progress = st.empty()
 
-# Start background thread if not already running for this key
-if _cache_key not in st.session_state:
-    if _thread_key not in st.session_state or not st.session_state[_thread_key].is_alive():
-        def _load_in_background():
-            try:
-                st.session_state[_cache_key] = load_season_data(start_str, end_str)
-            except Exception as exc:
-                st.session_state[_err_key] = exc
+def _load_in_background():
+    try:
+        _result['data'] = load_season_data(start_str, end_str)
+    except Exception as exc:
+        _result['error'] = exc
 
-        t = threading.Thread(target=_load_in_background, daemon=True)
-        st.session_state[_thread_key] = t
-        st.session_state[_t0_key] = _time.time()
-        t.start()
+_thread = threading.Thread(target=_load_in_background, daemon=True)
+_thread.start()
 
-# Poll: if still loading, show status and rerun after a short wait
-if _cache_key not in st.session_state:
-    if _err_key in st.session_state:
-        st.error(f'Failed to load data: {st.session_state[_err_key]}')
-        st.exception(st.session_state[_err_key])
-        st.stop()
-    elapsed = int(_time.time() - st.session_state.get(_t0_key, _time.time()))
-    st.info(f'⏳ Loading Statcast data... ({elapsed}s — full season pull takes 2–3 min)')
-    _time.sleep(2)
-    st.rerun()
+_dots = 0
+_start_t = _time.time()
+while _thread.is_alive():
+    _elapsed = int(_time.time() - _start_t)
+    _dots = (_dots + 1) % 4
+    _progress.info(
+        f'⏳ Loading Statcast data{"." * _dots}  '
+        f'({_elapsed}s — full season pull takes 2–3 min)'
+    )
+    _time.sleep(3)
 
-if _err_key in st.session_state:
-    st.error(f'Failed to load data: {st.session_state[_err_key]}')
-    st.exception(st.session_state[_err_key])
+_progress.empty()
+_thread.join()
+
+if 'error' in _result:
+    st.error(f'Failed to load data: {_result["error"]}')
+    import traceback
+    st.exception(_result['error'])
     st.stop()
 
-lb, pools = st.session_state[_cache_key]
+if 'data' not in _result:
+    st.error('Data load completed but returned no result. Check logs.')
+    st.stop()
+
+lb, pools = _result['data']
 
 # Filter and rerank
 lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
