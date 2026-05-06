@@ -597,6 +597,9 @@ with st.sidebar:
 
     st.markdown('---')
     if st.button('🔄 Force Refresh'):
+        import sys as _sys2
+        if '__tplus_data_store__' in _sys2.modules:
+            _sys2.modules['__tplus_data_store__'].clear()
         st.cache_data.clear()
         st.rerun()
 
@@ -613,14 +616,14 @@ def get_league_pools(start: str, end: str):
     _, df_raw = load_season_data(start, end)
     return build_league_pools(df_raw)
 
-# Background thread writes to a plain module-level dict (thread-safe for
-# simple key assignment). Session state tracks thread ref and start time.
-# Main thread polls with st.rerun() — no sleep() — keeping websocket alive.
-import threading, time as _time
+# Use sys.modules to store results — this dict is truly process-global and
+# survives Streamlit reruns, unlike globals() which gets a fresh scope each run.
+import threading, time as _time, sys as _sys
 
-# Module-level store: survives across reruns within the same server process
-if '_tplus_store' not in globals():
-    _tplus_store = {}
+_STORE_KEY = '__tplus_data_store__'
+if _STORE_KEY not in _sys.modules:
+    _sys.modules[_STORE_KEY] = {}
+_tplus_store = _sys.modules[_STORE_KEY]
 
 _cache_key  = f'data_{start_str}_{end_str}'
 _err_key    = f'err_{start_str}_{end_str}'
@@ -629,21 +632,19 @@ _t0_key     = f't0_{start_str}_{end_str}'
 
 # Start background thread if result not yet available and no thread running
 if _cache_key not in _tplus_store:
-    thread_running = (
-        _thread_key in st.session_state
-        and st.session_state[_thread_key].is_alive()
-    )
-    if not thread_running and _err_key not in _tplus_store:
+    _existing_thread = _tplus_store.get(_thread_key)
+    _thread_running  = _existing_thread is not None and _existing_thread.is_alive()
+    if not _thread_running and _err_key not in _tplus_store:
         def _load_in_background():
             try:
                 _tplus_store[_cache_key] = load_season_data(start_str, end_str)
             except Exception as exc:
                 _tplus_store[_err_key] = exc
 
-        t = threading.Thread(target=_load_in_background, daemon=True)
-        st.session_state[_thread_key] = t
-        st.session_state[_t0_key] = _time.time()
-        t.start()
+        _t = threading.Thread(target=_load_in_background, daemon=True)
+        _tplus_store[_thread_key] = _t
+        _tplus_store[_t0_key]     = _time.time()
+        _t.start()
 
 # Poll: show status and rerun without sleeping
 if _cache_key not in _tplus_store:
@@ -651,8 +652,8 @@ if _cache_key not in _tplus_store:
         st.error(f'Failed to load data: {_tplus_store[_err_key]}')
         st.exception(_tplus_store[_err_key])
         st.stop()
-    elapsed = int(_time.time() - st.session_state.get(_t0_key, _time.time()))
-    st.info(f'⏳ Loading Statcast data... ({elapsed}s — full season pull takes 2–3 min)')
+    _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
+    st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
     st.rerun()
 
 if _err_key in _tplus_store:
