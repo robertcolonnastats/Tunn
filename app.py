@@ -786,7 +786,7 @@ with tab1:
     disp = display[show_cols].rename(columns=col_names)
     st.dataframe(
         disp,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             'Rank':      st.column_config.NumberColumn(width='small'),
@@ -854,7 +854,7 @@ with tab2:
                 adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
                                           'ivb':'IVB','hb':'HB','frac':'Usage%'})
                 cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
-                st.dataframe(adf[cols], use_container_width=True, hide_index=True)
+                st.dataframe(adf[cols], width="stretch", hide_index=True)
         else:
             with st.spinner(f'Rendering card for {selected}…'):
                 try:
@@ -865,7 +865,7 @@ with tab2:
                     else:
                         html      = make_card_html(info)
                         jpg_bytes = render_card(html)
-                        st.image(jpg_bytes, use_container_width=False, width=720)
+                        st.image(jpg_bytes, width=720)
                         slug = selected.lower().replace(' ', '_').replace('.', '')
                         st.download_button(
                             label='⬇️ Download card JPG',
@@ -923,7 +923,7 @@ with tab4:
         except Exception:
             pass
 
-    st.dataframe(diag_df.round(4), use_container_width=True, hide_index=True)
+    st.dataframe(diag_df.round(4), width="stretch", hide_index=True)
 
     csv_bytes = diag_df.round(4).to_csv(index=False).encode()
     st.download_button(
@@ -1211,7 +1211,7 @@ with tab6:
                                         cname: f"{c_mix[idx]*100:.1f}%",
                                     })
                                 mix_df = pd.DataFrame(mix_data)
-                                st.dataframe(mix_df, hide_index=True, use_container_width=False)
+                                st.dataframe(mix_df, hide_index=True, width="content")
 
                             # Metric comparison
                             st.markdown("**Metric Comparison**")
@@ -1233,7 +1233,7 @@ with tab6:
                                     cname: f'{c_val:{fmt}}',
                                 })
                             met_df = pd.DataFrame(met_data)
-                            st.dataframe(met_df, hide_index=True, use_container_width=False)
+                            st.dataframe(met_df, hide_index=True, width="content")
 
                             if st.button(f"Open {cname}'s Player Card", key=f'comp_nav_{rank_i}_{cname}'):
                                 st.session_state['selected_pitcher'] = cname
