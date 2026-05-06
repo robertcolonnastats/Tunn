@@ -604,20 +604,22 @@ with st.sidebar:
         st.rerun()
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_season_data(start: str, end: str):
+# NOTE: _load_season_data_direct is the raw function used by the background
+# thread. st.cache_data decorators cannot be called from non-Streamlit threads
+# (they try to access ScriptRunContext and fail). The thread calls this directly;
+# the result is stored in sys.modules and the main thread reads it from there.
+def _load_season_data_direct(start: str, end: str):
     df_raw = load_statcast(start, end, verbose=False)
     c, f   = run_model(df_raw)
     q      = normalize(c, f)
     return q, df_raw
 
+# Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
 @st.cache_data(ttl=21600, show_spinner=False)
-def get_league_pools(start: str, end: str):
-    _, df_raw = load_season_data(start, end)
-    return build_league_pools(df_raw)
+def load_season_data(start: str, end: str):
+    return _load_season_data_direct(start, end)
 
-# Use sys.modules to store results — this dict is truly process-global and
-# survives Streamlit reruns, unlike globals() which gets a fresh scope each run.
+# Use sys.modules to store results — truly process-global, survives reruns.
 import threading, time as _time, sys as _sys
 
 _STORE_KEY = '__tplus_data_store__'
@@ -637,7 +639,8 @@ if _cache_key not in _tplus_store:
     if not _thread_running and _err_key not in _tplus_store:
         def _load_in_background():
             try:
-                _tplus_store[_cache_key] = load_season_data(start_str, end_str)
+                # Call the raw function directly — NOT the st.cache_data wrapper
+                _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
             except Exception as exc:
                 _tplus_store[_err_key] = exc
 
