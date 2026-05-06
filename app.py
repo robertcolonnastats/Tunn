@@ -651,9 +651,21 @@ if _cache_key not in _tplus_store:
 
 # Poll: show status and rerun without sleeping
 if _cache_key not in _tplus_store:
+    _thread_done = (
+        _tplus_store.get(_thread_key) is not None
+        and not _tplus_store[_thread_key].is_alive()
+    )
+    # Show error if one was recorded
     if _err_key in _tplus_store:
         st.error(f'Failed to load data: {_tplus_store[_err_key]}')
         st.exception(_tplus_store[_err_key])
+        st.stop()
+    # Thread finished but no result and no error — something went wrong silently
+    if _thread_done:
+        st.error(
+            'Data load thread finished without producing a result. '
+            f'Store keys: {list(_tplus_store.keys())}'
+        )
         st.stop()
     _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
     st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
