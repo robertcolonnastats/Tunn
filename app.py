@@ -253,16 +253,14 @@ def build_league_pools(pools_df):
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def get_league_pools(start: str, end: str):
-    """Cached wrapper: returns league pool stats for player card component scores."""
-    # Pull from the already-loaded data store so we don't re-fetch Statcast
-    _store_key = '__tplus_data_store__'
+    """Cached wrapper: builds league pool stats for player card component scores.
+    Pulls from the already-loaded store so no extra Statcast fetch is needed."""
     import sys as _s
-    store = _s.modules.get(_store_key, {})
-    _key  = f'data_{start}_{end}'
-    if _key in store:
-        _, pools_df = store[_key]
+    store = _s.modules.get('__tplus_data_store__', {})
+    key   = f'data_{start}_{end}'
+    if key in store:
+        _, pools_df = store[key]
     else:
-        # Fallback: re-load (should not normally happen)
         _, pools_df = load_season_data(start, end)
     return build_league_pools(pools_df)
 
@@ -628,7 +626,11 @@ def _load_season_data_direct(start: str, end: str):
     df_raw = load_statcast(start, end, verbose=False)
     c, f   = run_model(df_raw)
     q      = normalize(c, f)
-    return q, df_raw
+    # Store aggregated pools (f) not raw Statcast (df_raw) — df_raw is hundreds
+    # of MB and is only needed to produce f. Dropping it here prevents OOM crashes
+    # when switching seasons, and is correct: all downstream code uses f (pools).
+    del df_raw
+    return q, f
 
 # Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -665,46 +667,47 @@ if _cache_key not in _tplus_store:
         _tplus_store[_t0_key]     = _time.time()
         _t.start()
 
-# Poll: show status and rerun without sleeping
+# Poll: show status and rerun
 if _cache_key not in _tplus_store:
     _thread_done = (
         _tplus_store.get(_thread_key) is not None
         and not _tplus_store[_thread_key].is_alive()
     )
     _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
-    # Show error if one was recorded
+
+    # Error recorded by thread
     if _err_key in _tplus_store:
         _err = _tplus_store[_err_key]
         st.error(f'Failed to load data: {_err}')
         st.exception(_err)
         if st.button('🔄 Retry'):
-            for k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(k, None)
+            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
+                _tplus_store.pop(_k, None)
             st.rerun()
         st.stop()
+
     # Hard timeout — 8 minutes
     if _elapsed > 480:
-        st.error(
-            f'Data load timed out after {_elapsed}s. '
-            'Try a shorter date range or click Retry.'
-        )
+        st.error(f'Data load timed out after {_elapsed}s. Try a shorter date range or click Retry.')
         if st.button('🔄 Retry'):
-            for k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(k, None)
+            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
+                _tplus_store.pop(_k, None)
             st.rerun()
         st.stop()
-    # Thread finished but no result and no error — something went wrong silently
+
+    # Thread done but no result and no error
     if _thread_done:
         st.error(
-            'Data load thread finished without producing a result. '
+            'Data load thread finished without a result. '
             f'Store keys: {list(_tplus_store.keys())}. '
             'This may be a pybaseball connectivity issue.'
         )
         if st.button('🔄 Retry'):
-            for k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(k, None)
+            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
+                _tplus_store.pop(_k, None)
             st.rerun()
         st.stop()
+
     st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
     _time.sleep(2)
     st.rerun()
@@ -1079,14 +1082,13 @@ with tab6:
 
     if comp_target:
         # ── Build pitch mix vectors ────────────────────────────────────────
-        # pools is the raw per-pitcher-per-pitch_type df returned from load_season_data
-        # lb is the leaderboard; pools is df_raw from the same call
-        _lb, _pools = _tplus_store[_cache_key]
+        # `pools` is the aggregated per-pitcher/per-pitch-type df (already in scope)
+        # It has columns: pitcher_name, pitch_type, pitches, etc.
 
         ALL_TYPES = ['FF', 'SI', 'FC', 'SL', 'ST', 'CU', 'KC', 'CH', 'FS', 'KN', 'EP', 'SC']
 
         def _pitch_mix_vec(pitcher_name):
-            rows = _pools[_pools['pitcher_name'] == pitcher_name]
+            rows = pools[pools['pitcher_name'] == pitcher_name]
             rows = rows[rows['pitches'] >= 10]
             total = rows['pitches'].sum()
             if total == 0:
@@ -1121,111 +1123,108 @@ with tab6:
         target_row = lb_filtered[lb_filtered['name'] == comp_target]
         if target_row.empty:
             st.warning("Pitcher not found in leaderboard.")
-            st.stop()
-
-        target_hand = target_row.iloc[0]['hand']
-        target_mix  = _pitch_mix_vec(comp_target)
-
-        target_metrics_row = lb_metrics[lb_metrics['name'] == comp_target]
-        if target_metrics_row.empty or target_mix is None:
-            st.warning("Not enough data for this pitcher.")
-            st.stop()
-
-        target_z = target_metrics_row[z_cols].values[0]
-
-        # ── Score all same-handed pitchers ─────────────────────────────────
-        same_hand = lb_metrics[
-            (lb_metrics['hand'] == target_hand) &
-            (lb_metrics['name'] != comp_target)
-        ]
-
-        scores = []
-        for _, row in same_hand.iterrows():
-            cand_name = row['name']
-            cand_mix  = _pitch_mix_vec(cand_name)
-            if cand_mix is None:
-                continue
-            mix_sim    = _cosine_sim(target_mix, cand_mix)          # 0–1, higher = more similar
-            cand_z     = row[z_cols].values
-            metric_dist = np.linalg.norm(target_z - cand_z)         # lower = more similar
-            metric_sim  = 1.0 / (1.0 + metric_dist)                 # convert to 0–1
-            combined    = 0.50 * mix_sim + 0.50 * metric_sim
-            scores.append((cand_name, combined, mix_sim, metric_sim))
-
-        scores.sort(key=lambda x: -x[1])
-        top3 = scores[:3]
-
-        if not top3:
-            st.warning("Not enough same-handed pitchers for comparison.")
         else:
-            # ── Display ────────────────────────────────────────────────────
-            target_lb = lb_filtered[lb_filtered['name'] == comp_target].iloc[0]
-            target_tp = target_lb['tunneling_plus']
-            target_pct = int(target_lb['tp_pct'])
+            target_hand = target_row.iloc[0]['hand']
+            target_mix  = _pitch_mix_vec(comp_target)
 
-            st.markdown(f"**{comp_target}** ({target_hand}HP) · T+ **{target_tp:.1f}** · {target_pct}th pct")
-            st.markdown("---")
-            st.markdown("**Top 3 Tunnel Comps:**")
+            target_metrics_row = lb_metrics[lb_metrics['name'] == comp_target]
+            if target_metrics_row.empty or target_mix is None:
+                st.warning("Not enough data for this pitcher.")
+            else:
+                target_z = target_metrics_row[z_cols].values[0]
 
-            for rank_i, (cname, combined, mix_s, met_s) in enumerate(top3, 1):
-                comp_lb = lb_filtered[lb_filtered['name'] == cname].iloc[0]
-                comp_tp  = comp_lb['tunneling_plus']
-                comp_pct = int(comp_lb['tp_pct'])
-                comp_team = comp_lb.get('team', '')
+                # ── Score all same-handed pitchers ─────────────────────────────────
+                same_hand = lb_metrics[
+                    (lb_metrics['hand'] == target_hand) &
+                    (lb_metrics['name'] != comp_target)
+                ]
 
-                # Pitch mix comparison
-                t_mix = _pitch_mix_vec(comp_target)
-                c_mix = _pitch_mix_vec(cname)
-                shared_types = [pt for i, pt in enumerate(ALL_TYPES)
-                                if (t_mix[i] > 0.03 or c_mix[i] > 0.03)]
+                scores = []
+                for _, row in same_hand.iterrows():
+                    cand_name = row['name']
+                    cand_mix  = _pitch_mix_vec(cand_name)
+                    if cand_mix is None:
+                        continue
+                    mix_sim    = _cosine_sim(target_mix, cand_mix)
+                    cand_z     = row[z_cols].values
+                    metric_dist = np.linalg.norm(target_z - cand_z)
+                    metric_sim  = 1.0 / (1.0 + metric_dist)
+                    combined    = 0.50 * mix_sim + 0.50 * metric_sim
+                    scores.append((cand_name, combined, mix_sim, metric_sim))
 
-                with st.expander(
-                    f"#{rank_i} **{cname}** ({comp_team}) · T+ {comp_tp:.1f} · "
-                    f"{comp_pct}th pct · Similarity {combined*100:.0f}%",
-                    expanded=True
-                ):
-                    mc1, mc2, mc3 = st.columns(3)
-                    mc1.metric("Overall Similarity", f"{combined*100:.0f}%")
-                    mc2.metric("Pitch Mix Similarity", f"{mix_s*100:.0f}%")
-                    mc3.metric("Metric Similarity", f"{met_s*100:.0f}%")
+                scores.sort(key=lambda x: -x[1])
+                top3 = scores[:3]
 
-                    # Pitch mix side-by-side
-                    if shared_types:
-                        st.markdown("**Pitch Mix Comparison**")
-                        mix_data = []
-                        for pt in shared_types:
-                            idx = ALL_TYPES.index(pt)
-                            mix_data.append({
-                                'Pitch': pt,
-                                comp_target: f"{t_mix[idx]*100:.1f}%",
-                                cname: f"{c_mix[idx]*100:.1f}%",
-                            })
-                        import pandas as pd
-                        mix_df = pd.DataFrame(mix_data)
-                        st.dataframe(mix_df, hide_index=True, use_container_width=False)
+                if not top3:
+                    st.warning("Not enough same-handed pitchers for comparison.")
+                else:
+                    # ── Display ────────────────────────────────────────────────────
+                    target_lb = lb_filtered[lb_filtered['name'] == comp_target].iloc[0]
+                    target_tp = target_lb['tunneling_plus']
+                    target_pct = int(target_lb['tp_pct'])
 
-                    # Metric comparison
-                    st.markdown("**Metric Comparison**")
-                    metric_labels = {
-                        'tunneling_plus': 'T+',
-                        'avg_tunnel_ratio': 'Avg Tunnel Ratio',
-                        'n_tunnel_pairs': 'Tunnel Pairs',
-                        'n_speed_pairs': 'Speed Pairs',
-                        'temporal': 'Temporal Score',
-                    }
-                    met_data = []
-                    for col, label in metric_labels.items():
-                        t_val = target_lb[col]
-                        c_val = comp_lb[col]
-                        fmt = '.1f' if col == 'tunneling_plus' else '.3f' if col in ('avg_tunnel_ratio', 'temporal') else '.0f'
-                        met_data.append({
-                            'Metric': label,
-                            comp_target: f'{t_val:{fmt}}',
-                            cname: f'{c_val:{fmt}}',
-                        })
-                    met_df = pd.DataFrame(met_data)
-                    st.dataframe(met_df, hide_index=True, use_container_width=False)
+                    st.markdown(f"**{comp_target}** ({target_hand}HP) · T+ **{target_tp:.1f}** · {target_pct}th pct")
+                    st.markdown("---")
+                    st.markdown("**Top 3 Tunnel Comps:**")
 
-                    if st.button(f"Open {cname}'s Player Card", key=f'comp_nav_{rank_i}_{cname}'):
-                        st.session_state['selected_pitcher'] = cname
-                        st.session_state['comp_target'] = comp_target
+                    for rank_i, (cname, combined, mix_s, met_s) in enumerate(top3, 1):
+                        comp_lb = lb_filtered[lb_filtered['name'] == cname].iloc[0]
+                        comp_tp  = comp_lb['tunneling_plus']
+                        comp_pct = int(comp_lb['tp_pct'])
+                        comp_team = comp_lb.get('team', '')
+
+                        # Pitch mix comparison
+                        t_mix = _pitch_mix_vec(comp_target)
+                        c_mix = _pitch_mix_vec(cname)
+                        shared_types = [pt for i, pt in enumerate(ALL_TYPES)
+                                        if (t_mix[i] > 0.03 or c_mix[i] > 0.03)]
+
+                        with st.expander(
+                            f"#{rank_i} **{cname}** ({comp_team}) · T+ {comp_tp:.1f} · "
+                            f"{comp_pct}th pct · Similarity {combined*100:.0f}%",
+                            expanded=True
+                        ):
+                            mc1, mc2, mc3 = st.columns(3)
+                            mc1.metric("Overall Similarity", f"{combined*100:.0f}%")
+                            mc2.metric("Pitch Mix Similarity", f"{mix_s*100:.0f}%")
+                            mc3.metric("Metric Similarity", f"{met_s*100:.0f}%")
+
+                            # Pitch mix side-by-side
+                            if shared_types:
+                                st.markdown("**Pitch Mix Comparison**")
+                                mix_data = []
+                                for pt in shared_types:
+                                    idx = ALL_TYPES.index(pt)
+                                    mix_data.append({
+                                        'Pitch': pt,
+                                        comp_target: f"{t_mix[idx]*100:.1f}%",
+                                        cname: f"{c_mix[idx]*100:.1f}%",
+                                    })
+                                mix_df = pd.DataFrame(mix_data)
+                                st.dataframe(mix_df, hide_index=True, use_container_width=False)
+
+                            # Metric comparison
+                            st.markdown("**Metric Comparison**")
+                            metric_labels = {
+                                'tunneling_plus': 'T+',
+                                'avg_tunnel_ratio': 'Avg Tunnel Ratio',
+                                'n_tunnel_pairs': 'Tunnel Pairs',
+                                'n_speed_pairs': 'Speed Pairs',
+                                'temporal': 'Temporal Score',
+                            }
+                            met_data = []
+                            for col, label in metric_labels.items():
+                                t_val = target_lb[col]
+                                c_val = comp_lb[col]
+                                fmt = '.1f' if col == 'tunneling_plus' else '.3f' if col in ('avg_tunnel_ratio', 'temporal') else '.0f'
+                                met_data.append({
+                                    'Metric': label,
+                                    comp_target: f'{t_val:{fmt}}',
+                                    cname: f'{c_val:{fmt}}',
+                                })
+                            met_df = pd.DataFrame(met_data)
+                            st.dataframe(met_df, hide_index=True, use_container_width=False)
+
+                            if st.button(f"Open {cname}'s Player Card", key=f'comp_nav_{rank_i}_{cname}'):
+                                st.session_state['selected_pitcher'] = cname
+                                st.session_state['comp_target'] = comp_target
