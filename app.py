@@ -626,11 +626,10 @@ def _load_season_data_direct(start: str, end: str):
     df_raw = load_statcast(start, end, verbose=False)
     c, f   = run_model(df_raw)
     q      = normalize(c, f)
-    # Store aggregated pools (f) not raw Statcast (df_raw) — df_raw is hundreds
-    # of MB and is only needed to produce f. Dropping it here prevents OOM crashes
-    # when switching seasons, and is correct: all downstream code uses f (pools).
-    del df_raw
-    return q, f
+    # pools = df_raw — downstream code expects a DataFrame with pitcher_name,
+    # pitch_type, pitches, tunnel_x/z, plate_x/z, etc. (aggregated per pitcher/type).
+    # f (second return of run_model) is NOT a DataFrame — do not use it as pools.
+    return q, df_raw
 
 # Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -650,6 +649,18 @@ _err_key    = f'err_{start_str}_{end_str}'
 _thread_key = f'thread_{start_str}_{end_str}'
 _t0_key     = f't0_{start_str}_{end_str}'
 
+# ── Evict any OTHER season's data immediately so we never hold two seasons
+#    in RAM at the same time. Do this before starting the new thread.
+for _stale_key in [k for k in list(_tplus_store.keys())
+                   if k.startswith('data_') and k != _cache_key]:
+    del _tplus_store[_stale_key]
+# Also cancel any stale threads from other seasons (they're daemon threads
+# so they'll die naturally, but clear their keys so UI doesn't get confused).
+for _stale_k in [k for k in list(_tplus_store.keys())
+                 if (k.startswith('thread_') or k.startswith('err_') or k.startswith('t0_'))
+                 and not k.endswith(f'_{start_str}_{end_str}')]:
+    _tplus_store.pop(_stale_k, None)
+
 # Start background thread if result not yet available and no thread running
 if _cache_key not in _tplus_store:
     _existing_thread = _tplus_store.get(_thread_key)
@@ -657,7 +668,6 @@ if _cache_key not in _tplus_store:
     if not _thread_running and _err_key not in _tplus_store:
         def _load_in_background():
             try:
-                # Call the raw function directly — NOT the st.cache_data wrapper
                 _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
             except Exception as exc:
                 _tplus_store[_err_key] = exc
