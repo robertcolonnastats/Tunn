@@ -1509,6 +1509,14 @@ with tab7:
             st.markdown("---")
             st.markdown("#### League-Wide Correlations")
             st.caption(f"Pearson r across {len(merged)} pitchers · 2026")
+            st.markdown(
+                "Each cell shows how strongly a tunneling metric (rows) correlates with a real-world "
+                "outcome (columns). A value near **+1.0** means the two move together — pitchers who "
+                "score higher on that metric also tend to have better outcomes. Near **-1.0** means "
+                "they move opposite. Near **0** means little relationship. "
+                "For xERA and xwOBA, a *negative* correlation with T+ is the good sign — "
+                "it means pitchers who tunnel well tend to allow weaker contact."
+            )
 
             corr_data = []
             for tcol, tlabel in avail_tunnel.items():
@@ -1533,16 +1541,19 @@ with tab7:
 
             styled = corr_df.style.map(_color_r).format('{:.3f}', na_rep='—')
             st.dataframe(styled, width='stretch')
-            st.caption(
-                "Green = positive correlation · Red = negative · "
-                "For xERA/xwOBA, negative r with T+ means better pitchers tunnel better"
-            )
+
 
             # ══════════════════════════════════════════════════════════════════
             # SECTION 2: Scatter explorer
             # ══════════════════════════════════════════════════════════════════
             st.markdown("---")
             st.markdown("#### Scatter Explorer")
+            st.markdown(
+                "Pick any tunneling metric and outcome to see how they relate across all qualified "
+                "pitchers this season. Each dot is one pitcher — hover to see who it is. "
+                "The dashed line is the best-fit trend. A steep upward slope means the metric "
+                "is a strong predictor of that outcome."
+            )
 
             sc1, sc2 = st.columns(2)
             with sc1:
@@ -1632,7 +1643,13 @@ with tab7:
             # ══════════════════════════════════════════════════════════════════
             st.markdown("---")
             st.markdown("#### Individual Pitcher Breakdown")
-            st.caption("Expected outcome range from regression vs. actual results. Only |r| ≥ 0.10 shown.")
+            st.markdown(
+                "For each pitcher, this shows what their tunneling metrics *predict* their outcomes "
+                "should be based on league-wide regression, and how their actual results compare. "
+                "**Exp Range** is ±1 standard deviation around the prediction — roughly where 68% "
+                "of pitchers with a similar metric profile land. ✅ means outperforming the model, "
+                "⚠️ means underperforming. Only metric/outcome pairs with |r| ≥ 0.10 are shown."
+            )
 
             all_names_corr = sorted(merged['name'].dropna().unique().tolist())
             _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
@@ -1651,7 +1668,8 @@ with tab7:
                         if abs(r) < 0.10: continue
                         _xv = pair[tcol].values.astype(float)
                         _yv = pair[ocol].values.astype(float)
-                        _m, _b = float(np.polyfit(_xv, _yv, 1))
+                        _coeffs = np.polyfit(_xv, _yv, 1)
+                        _m, _b = float(_coeffs[0]), float(_coeffs[1])
                         pred   = _m * float(pr[tcol]) + _b
                         sd     = float(np.std(_yv - (_m * _xv + _b)))
                         actual = pr.get(ocol, None)
