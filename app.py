@@ -724,47 +724,49 @@ def load_season_data(start: str, end: str):
     return _load_season_data_direct(start, end)
 
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_outcome_data(season: int):
-    """Pull outcome stats from Baseball Savant via pybaseball (same domain as main load).
-    Three sources merged on pitcher MLBAM id:
-      - statcast_pitcher_exitvelo_barrels : K%, BB%, Whiff%, Barrel%, Hard Hit%
-      - statcast_pitcher_expected_stats   : xwOBA, xERA, xBA
-      - statcast_pitcher_pitch_arsenal    : Chase%, GB%, O-Swing%, Z-Contact%
+    """Pull outcome stats from multiple Baseball Savant + Baseball Reference sources.
+    All merge on pitcher MLBAM id except bref which joins on name.
+
+    Sources:
+      1. statcast_pitcher_exitvelo_barrels  → K%, BB%, Whiff%, Barrel%, Hard Hit%
+      2. statcast_pitcher_expected_stats    → xwOBA, xERA, xBA
+      3. statcast_pitcher_arsenal_stats     → Whiff%, Chase%, CSW%, GB%, K% per pitch type
+                                              (aggregated to pitcher level)
+      4. pitching_stats_bref                → ERA, WHIP, BAA (AVG against), SO, IP
     """
-    try:
-        from pybaseball import (
-            statcast_pitcher_exitvelo_barrels as _evb,
-            statcast_pitcher_expected_stats   as _exp,
-            statcast_pitcher_pitch_arsenal    as _ars,
-        )
+    import traceback as _tb
 
-        def _prep(df):
-            df = df.copy()
-            df.columns = [c.lower().strip() for c in df.columns]
-            for id_col in ('pitcher', 'player_id', 'mlbam_id'):
-                if id_col in df.columns:
-                    df.rename(columns={id_col: 'pitcher_id'}, inplace=True)
-                    break
+    def _prep_id(df):
+        """Lowercase columns, standardise pitcher id column name."""
+        df = df.copy()
+        df.columns = [c.lower().strip() for c in df.columns]
+        for id_col in ('pitcher', 'player_id', 'mlbam_id', 'pitcher_id'):
+            if id_col in df.columns and id_col != 'pitcher_id':
+                df.rename(columns={id_col: 'pitcher_id'}, inplace=True)
+                break
+        if 'pitcher_id' in df.columns:
             df['pitcher_id'] = pd.to_numeric(df['pitcher_id'], errors='coerce')
-            return df
+        return df
 
-        ev = _prep(_evb(season, minBBE=25))
-        ex = _prep(_exp(season, minPA=25))
-        # pitch_arsenal has one row per pitcher per pitch type — aggregate to pitcher level
-        ar_raw = _prep(_ars(season, minP=50, arsenal_type='n_'))
-        # columns of interest from arsenal: gb_percent, o_swing_percent, z_contact_percent, whiff_percent
-        # aggregate by pitcher_id (mean across pitch types, weighted by pitch count if available)
-        ar_cols = [c for c in ar_raw.columns if c in (
-            'gb_percent','o_swing_percent','z_contact_percent',
-            'whiff_percent','chase_percent','csw_percent',
-        )]
-        if ar_cols and 'pitcher_id' in ar_raw.columns:
-            ar = ar_raw.groupby('pitcher_id')[ar_cols].mean().reset_index()
-        else:
-            ar = pd.DataFrame(columns=['pitcher_id'])
+    def _to_num(df, skip=('pitcher_id','player_name','last_name','first_name','name','team','name_first','name_last')):
+        for col in df.columns:
+            if col not in skip:
+                df[col] = pd.to_numeric(
+                    df[col].astype(str).str.replace('%','').str.strip(),
+                    errors='coerce'
+                )
+        return df
 
-        # Column rename maps
+    errors = []
+    out = pd.DataFrame()
+
+    # ── Source 1: Statcast leaderboard (K%, BB%, Whiff%, Barrel%, Hard Hit%) ──
+    try:
+        from pybaseball import statcast_pitcher_exitvelo_barrels as _evb
+        ev = _to_num(_prep_id(_evb(season, minBBE=25)))
         EV_MAP = {
             'k_percent':         'k_pct',
             'bb_percent':        'bb_pct',
@@ -772,144 +774,99 @@ def load_outcome_data(season: int):
             'barrel_batted_rate':'barrel_pct',
             'hard_hit_percent':  'hard_hit_pct',
         }
-        EX_MAP = {
-            'est_woba': 'xwoba',
-            'est_era':  'xera',
-            'est_ba':   'xba',
-        }
+        keep = ['pitcher_id'] + [c for c in EV_MAP if c in ev.columns]
+        out = ev[keep].rename(columns=EV_MAP)
+    except Exception as e:
+        errors.append(f'exitvelo_barrels: {e}')
+
+    # ── Source 2: Expected stats (xwOBA, xERA, xBA) ───────────────────────────
+    try:
+        from pybaseball import statcast_pitcher_expected_stats as _exp
+        ex = _to_num(_prep_id(_exp(season, minPA=25)))
+        EX_MAP = {'est_woba': 'xwoba', 'est_era': 'xera', 'est_ba': 'xba'}
+        keep = ['pitcher_id'] + [c for c in EX_MAP if c in ex.columns]
+        ex_c = ex[keep].rename(columns=EX_MAP)
+        out = out.merge(ex_c, on='pitcher_id', how='outer') if not out.empty else ex_c
+    except Exception as e:
+        errors.append(f'expected_stats: {e}')
+
+    # ── Source 3: Arsenal stats (Whiff%, Chase%, CSW%, GB% per pitch → agg) ──
+    try:
+        from pybaseball import statcast_pitcher_arsenal_stats as _ars
+        ar_raw = _to_num(_prep_id(_ars(season, minPA=10)))
         AR_MAP = {
-            'gb_percent':         'gb_pct',
-            'o_swing_percent':    'o_swing_pct',
-            'z_contact_percent':  'z_contact_pct',
-            'whiff_percent':      'whiff_pct_ar',  # deduplicate if both sources have it
-            'chase_percent':      'chase_pct',
-            'csw_percent':        'csw_pct',
+            'whiff_percent':    'whiff_pct_ar',
+            'k_percent':        'k_pct_ar',
+            'bb_percent':       'bb_pct_ar',
+            'chase_percent':    'chase_pct',
+            'csw_percent':      'csw_pct',
+            'gb_percent':       'gb_pct',
+            'o_swing_percent':  'o_swing_pct',
+            'z_contact_percent':'z_contact_pct',
+            'put_away_percent': 'put_away_pct',
         }
+        ar_cols = [c for c in AR_MAP if c in ar_raw.columns]
+        if ar_cols and 'pitcher_id' in ar_raw.columns:
+            ar_grp = ar_raw.groupby('pitcher_id')[ar_cols].mean().reset_index()
+            ar_c   = ar_grp.rename(columns=AR_MAP)
+            # Merge, preferring source 1 whiff/k/bb over arsenal aggregate
+            out = out.merge(ar_c, on='pitcher_id', how='outer') if not out.empty else ar_c
+            for base in ('whiff_pct', 'k_pct', 'bb_pct'):
+                ar_ver = base + '_ar'
+                if base in out.columns and ar_ver in out.columns:
+                    out[base] = out[base].fillna(out[ar_ver])
+                    out.drop(columns=[ar_ver], inplace=True)
+                elif ar_ver in out.columns:
+                    out.rename(columns={ar_ver: base}, inplace=True)
+    except Exception as e:
+        errors.append(f'arsenal_stats: {e}')
 
-        def _slim(df, col_map):
-            keep = ['pitcher_id'] + [c for c in col_map if c in df.columns]
-            return df[keep].rename(columns=col_map)
+    # ── Source 4: Baseball Reference (ERA, WHIP, BAA, SO, IP) ────────────────
+    try:
+        from pybaseball import pitching_stats_bref as _bref
+        br = _bref(season)
+        br.columns = [c.lower().strip() for c in br.columns]
+        # bref has 'name' not an id — join by normalised name later
+        BR_MAP = {
+            'era':  'era',
+            'whip': 'whip',
+            'avg':  'baa',    # batting avg against
+            'so':   'so',
+            'ip':   'ip',
+        }
+        keep = ['name'] + [c for c in BR_MAP if c in br.columns]
+        br_c = br[keep].rename(columns=BR_MAP)
+        br_c['_norm'] = br_c['name'].str.lower().str.strip()
+        for col in ('era','whip','baa','so','ip'):
+            if col in br_c.columns:
+                br_c[col] = pd.to_numeric(br_c[col].astype(str).str.replace('*','').str.strip(), errors='coerce')
+        # Store separately — joined after main merge using lb name
+        br_clean = br_c.drop(columns=['name'])
+    except Exception as e:
+        errors.append(f'bref: {e}')
+        br_clean = pd.DataFrame()
 
-        ev_c = _slim(ev, EV_MAP)
-        ex_c = _slim(ex, EX_MAP)
-        ar_c = _slim(ar, AR_MAP)
+    if out.empty:
+        return pd.DataFrame({'_error': ['; '.join(errors) or 'All sources failed'],
+                             '_tb': ['Check Streamlit Cloud logs']})
 
-        out = ev_c.merge(ex_c, on='pitcher_id', how='outer')                   .merge(ar_c, on='pitcher_id', how='outer')
+    # Final numeric pass
+    out = _to_num(out)
 
-        # Prefer ev whiff_pct; if ar also has it, drop the duplicate
-        if 'whiff_pct' in out.columns and 'whiff_pct_ar' in out.columns:
-            out['whiff_pct'] = out['whiff_pct'].fillna(out['whiff_pct_ar'])
-            out.drop(columns=['whiff_pct_ar'], inplace=True)
+    # Tag any load errors as metadata (non-blocking)
+    if errors:
+        out['_warnings'] = '; '.join(errors)
 
-        for col in out.columns:
-            if col != 'pitcher_id':
-                out[col] = pd.to_numeric(
-                    out[col].astype(str).str.replace('%','').str.strip(),
-                    errors='coerce'
-                )
-        return out
+    # Attach bref data via name normalisation — stored as separate key
+    # so tab code can merge it after joining on pitcher_id
+    out['_has_bref'] = not br_clean.empty
+    if not br_clean.empty:
+        # Can't merge on id here — store bref as JSON string in a metadata col
+        # Tab code will do the name-based join after id-join is done
+        import json as _j
+        out.attrs['bref'] = br_clean.to_dict('records')
 
-    except Exception as _e:
-        import traceback
-        return pd.DataFrame({'_error': [str(_e)], '_tb': [traceback.format_exc()]})
-
-
-
-
-# Use sys.modules to store results — truly process-global, survives reruns.
-import threading, time as _time, sys as _sys
-
-_STORE_KEY = '__tplus_data_store__'
-if _STORE_KEY not in _sys.modules:
-    _sys.modules[_STORE_KEY] = {}
-_tplus_store = _sys.modules[_STORE_KEY]
-
-_cache_key  = f'data_{start_str}_{end_str}'
-_err_key    = f'err_{start_str}_{end_str}'
-_thread_key = f'thread_{start_str}_{end_str}'
-_t0_key     = f't0_{start_str}_{end_str}'
-
-# Evict any OTHER season's data immediately so we never hold two seasons in RAM
-for _stale_key in [k for k in list(_tplus_store.keys())
-                   if k.startswith('data_') and k != _cache_key]:
-    del _tplus_store[_stale_key]
-for _stale_k in [k for k in list(_tplus_store.keys())
-                 if (k.startswith('thread_') or k.startswith('err_') or k.startswith('t0_'))
-                 and not k.endswith(f'_{start_str}_{end_str}')]:
-    _tplus_store.pop(_stale_k, None)
-
-# Start background thread if result not yet available and no thread running
-if _cache_key not in _tplus_store:
-    _existing_thread = _tplus_store.get(_thread_key)
-    _thread_running  = _existing_thread is not None and _existing_thread.is_alive()
-    if not _thread_running and _err_key not in _tplus_store:
-        def _load_in_background():
-            try:
-                _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
-            except Exception as exc:
-                _tplus_store[_err_key] = exc
-
-        _t = threading.Thread(target=_load_in_background, daemon=True)
-        _tplus_store[_thread_key] = _t
-        _tplus_store[_t0_key]     = _time.time()
-        _t.start()
-
-# Poll: show status and rerun
-if _cache_key not in _tplus_store:
-    _thread_done = (
-        _tplus_store.get(_thread_key) is not None
-        and not _tplus_store[_thread_key].is_alive()
-    )
-    _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
-    if _err_key in _tplus_store:
-        _err = _tplus_store[_err_key]
-        st.error(f'Failed to load data: {_err}')
-        st.exception(_err)
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-    if _elapsed > 480:
-        st.error(f'Data load timed out after {_elapsed}s. Try clicking Retry.')
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-    if _thread_done:
-        st.error(
-            'Data load thread finished without a result. '
-            f'Store keys: {list(_tplus_store.keys())}.'
-        )
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-    st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
-    _time.sleep(2)
-    st.rerun()
-
-if _err_key in _tplus_store:
-    st.error(f'Failed to load data: {_tplus_store[_err_key]}')
-    st.exception(_tplus_store[_err_key])
-    st.stop()
-
-lb, pools = _tplus_store[_cache_key]
-
-# Filter and rerank
-lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
-lb_filtered['rank'] = lb_filtered['tunneling_plus'].rank(
-    ascending=False, method='min').astype(int)
-lb_filtered['tp_pct'] = lb_filtered['tunneling_plus'].rank(
-    pct=True).mul(100).round(0).astype(int)
-
-# Percentile columns for leaderboard
-lb_filtered['tr_pct'] = lb_filtered['avg_tunnel_ratio'].rank(
-    pct=True).mul(100).round(0).astype(int)
-lb_filtered['spd_pct'] = lb_filtered['n_speed_pairs'].rank(
-    pct=True).mul(100).round(0).astype(int)
+    return out
 
 def _compute_rc(pools_df, pitcher_ids):
     from itertools import combinations as _comb
@@ -1473,7 +1430,23 @@ with tab7:
              'temporal', 'n_tunnel_pairs']
         ].copy()
         lb_corr['pitcher_id'] = pd.to_numeric(lb_corr['pitcher_id'], errors='coerce')
-        merged = lb_corr.merge(outcomes, on='pitcher_id', how='inner')
+
+        # Drop metadata cols before merge
+        _outcomes_clean = outcomes.drop(columns=[c for c in ('_warnings','_has_bref') if c in outcomes.columns], errors='ignore')
+        merged = lb_corr.merge(_outcomes_clean, on='pitcher_id', how='inner')
+
+        # Also join Baseball Reference traditional stats by normalised name
+        _bref_records = outcomes.attrs.get('bref', [])
+        if _bref_records:
+            import pandas as _pd2
+            bref_df = _pd2.DataFrame(_bref_records)
+            merged['_norm'] = merged['name'].str.lower().str.strip()
+            merged = merged.merge(bref_df, on='_norm', how='left').drop(columns=['_norm'])
+
+        if '_warnings' in outcomes.columns:
+            _warn = outcomes['_warnings'].iloc[0]
+            if _warn:
+                st.warning(f"Some outcome sources failed: {_warn}")
 
         if len(merged) < 5:
             st.warning(f"Only {len(merged)} pitchers matched. lb has {len(lb_corr)}, outcomes has {len(outcomes)}.")
@@ -1495,6 +1468,11 @@ with tab7:
                 'xwoba':         'xwOBA',
                 'xera':          'xERA',
                 'xba':           'xBA',
+                'era':           'ERA',
+                'whip':          'WHIP',
+                'baa':           'AVG Against',
+                'so':            'Strikeouts',
+                'ip':            'IP',
             }
             TUNNEL_COLS = {
                 'tunneling_plus':   'T+',
