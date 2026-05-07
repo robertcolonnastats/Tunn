@@ -724,46 +724,70 @@ def load_season_data(start: str, end: str):
     return _load_season_data_direct(start, end)
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_outcome_data(season: int):
-    """Pull FanGraphs pitching stats for outcome correlations. Fast (~1-2s)."""
+    """Pull outcome stats from Baseball Savant via pybaseball.
+    Uses the same baseballsavant.mlb.com domain as the main data load,
+    so this works on Streamlit Cloud. Two sources merged on pitcher_id:
+      - statcast_pitcher_exitvelo_barrels: K%, BB%, whiff%, barrel%, hard hit%
+      - statcast_pitcher_expected_stats:   xwOBA, xERA, xBA, xSLG
+    """
     try:
-        from pybaseball import pitching_stats as _ps
-        df = _ps(season, season, qual=20)
-        # Normalise column names — FanGraphs uses % suffix for rate stats
-        df.columns = [c.replace('%','_pct').replace('/','_per_').strip() for c in df.columns]
-        # Key outcome columns we care about (use whatever is present)
-        _want = {
-            'Name':      'fg_name',
-            'IDfg':      'fg_id',
-            'Team':      'fg_team',
-            'IP':        'ip',
-            'Whiff_pct': 'whiff_pct',
-            'SwStr_pct': 'swstr_pct',
-            'GB_pct':    'gb_pct',
-            'FB_pct':    'fb_pct',
-            'HR_per_FB': 'hr_per_fb',
-            'K_pct':     'k_pct',
-            'BB_pct':    'bb_pct',
-            'BABIP':     'babip',
-            'xFIP':      'xfip',
-            'xERA':      'xera',
-            'CSW_pct':   'csw_pct',
-            'O-Swing_pct':'o_swing_pct',
-            'Z-Contact_pct':'z_contact_pct',
+        from pybaseball import (
+            statcast_pitcher_exitvelo_barrels as _evb,
+            statcast_pitcher_expected_stats   as _exp,
+        )
+        # Statcast leaderboard — K%, BB%, whiff%, barrel%, hard_hit%
+        ev = _evb(season, minBBE=25)
+        ev.columns = [c.lower().strip() for c in ev.columns]
+        # Expected stats — xwOBA, xERA, xBA
+        ex = _exp(season, minPA=25)
+        ex.columns = [c.lower().strip() for c in ex.columns]
+
+        # Both have a 'pitcher' MLBAM id column and 'player_name'
+        # Standardise id column name
+        for df in (ev, ex):
+            if 'pitcher' in df.columns:
+                df.rename(columns={'pitcher': 'pitcher_id'}, inplace=True)
+            elif 'player_id' in df.columns:
+                df.rename(columns={'player_id': 'pitcher_id'}, inplace=True)
+            df['pitcher_id'] = pd.to_numeric(df['pitcher_id'], errors='coerce')
+
+        # Columns we want from each source
+        EV_COLS = {
+            'k_percent':        'k_pct',
+            'bb_percent':       'bb_pct',
+            'whiff_percent':    'whiff_pct',
+            'barrel_batted_rate':'barrel_pct',
+            'hard_hit_percent': 'hard_hit_pct',
         }
-        rename = {k: v for k, v in _want.items() if k in df.columns}
-        df = df[list(rename.keys())].rename(columns=rename)
-        # Scrub pct columns that come in as strings like "21.3 %"
-        for col in df.columns:
-            if col not in ('fg_name', 'fg_team', 'fg_id'):
-                df[col] = pd.to_numeric(
-                    df[col].astype(str).str.replace('%','').str.strip(),
+        EX_COLS = {
+            'est_woba':         'xwoba',
+            'est_era':          'xera',
+            'est_ba':           'xba',
+        }
+
+        ev_keep = ['pitcher_id'] + [c for c in EV_COLS if c in ev.columns]
+        ex_keep = ['pitcher_id'] + [c for c in EX_COLS if c in ex.columns]
+
+        ev_clean = ev[ev_keep].rename(columns=EV_COLS)
+        ex_clean = ex[ex_keep].rename(columns=EX_COLS)
+
+        merged = ev_clean.merge(ex_clean, on='pitcher_id', how='outer')
+
+        # Convert all stat cols to numeric
+        for col in merged.columns:
+            if col != 'pitcher_id':
+                merged[col] = pd.to_numeric(
+                    merged[col].astype(str).str.replace('%','').str.strip(),
                     errors='coerce'
                 )
-        return df
-    except Exception as e:
-        return pd.DataFrame()  # fail gracefully — tab shows a message
+        return merged
+
+    except Exception as _e:
+        # Return empty df — tab will show a clear error message
+        import traceback
+        return pd.DataFrame({'_error': [str(_e)], '_tb': [traceback.format_exc()]})
 
 # Use sys.modules to store results — truly process-global, survives reruns.
 import threading, time as _time, sys as _sys
@@ -1420,216 +1444,132 @@ with tab7:
     st.markdown("### Metric Correlations")
     st.caption(
         "How do tunneling metrics relate to real-world outcomes? "
-        "Upload a CSV of pitcher outcome stats to see league-wide correlations "
-        "and per-pitcher expected vs. actual breakdowns."
+        "Outcome data pulled automatically from Baseball Savant."
     )
 
-    st.markdown("#### Upload Outcome Data")
-    with st.expander("How to get the data (30 seconds)", expanded=False):
-        st.markdown("""
-**From Baseball Savant** (recommended — has xwOBA, whiff%, barrel%):
-1. Go to [baseballsavant.mlb.com/leaderboard/custom](https://baseballsavant.mlb.com/leaderboard/custom)
-2. Set Year = 2026, Type = Pitcher, Min PA = 50
-3. Add columns: K%, BB%, Whiff%, xwOBA, xERA, Hard Hit%, Barrel%
-4. Click **Download CSV** at the bottom
+    with st.spinner("Loading outcome data from Baseball Savant..."):
+        outcomes = load_outcome_data(season)
 
-**From FanGraphs** (has GB%, FB%, CSW%, O-Swing%):
-1. Go to [fangraphs.com/leaders](https://www.fangraphs.com/leaders/major-league)
-2. Season = 2026, Position = P, Min IP = 10
-3. Stat groups: Standard + Batted Ball + Advanced
-4. Export CSV
-        """)
-
-    uploaded = st.file_uploader(
-        "Upload pitcher stats CSV (Savant or FanGraphs)",
-        type=['csv'],
-        key='outcomes_upload'
-    )
-
-    if uploaded is None:
-        st.info("Upload a CSV above to unlock the correlations tab.")
+    if outcomes.empty or '_error' in outcomes.columns:
+        err_msg = outcomes['_error'].iloc[0] if '_error' in outcomes.columns else "Empty response"
+        tb_msg  = outcomes['_tb'].iloc[0]    if '_tb'    in outcomes.columns else ""
+        st.error(f"Could not load outcome data: {err_msg}")
+        if tb_msg:
+            with st.expander("Full traceback"):
+                st.code(tb_msg)
     else:
-        import io as _io
-        try:
-            raw_outcomes = pd.read_csv(_io.BytesIO(uploaded.read()))
-        except Exception as e:
-            st.error(f"Could not read CSV: {e}")
-            raw_outcomes = pd.DataFrame()
+        # ── Join tunneling metrics with outcomes on pitcher_id ─────────────────
+        lb_corr = lb_filtered[
+            ['pitcher_id', 'name', 'hand', 'team', 'pitches',
+             'tunneling_plus', 'tp_pct',
+             'avg_tunnel_ratio', 'tr_pct',
+             'n_speed_pairs', 'spd_pct',
+             'rc_val', 'rc_pct',
+             'temporal', 'n_tunnel_pairs']
+        ].copy()
+        lb_corr['pitcher_id'] = pd.to_numeric(lb_corr['pitcher_id'], errors='coerce')
 
-        if raw_outcomes.empty:
-            st.error("CSV appears empty.")
+        merged = lb_corr.merge(outcomes, on='pitcher_id', how='inner')
+
+        if len(merged) < 5:
+            st.warning(
+                f"Only {len(merged)} pitchers matched on pitcher_id. "
+                f"lb has {len(lb_corr)}, outcomes has {len(outcomes)}. "
+                "Check that pitcher_id column types match."
+            )
         else:
-            st.success(f"Loaded {len(raw_outcomes)} rows, {len(raw_outcomes.columns)} columns.")
+            st.success(f"Matched {len(merged)} pitchers.")
 
-            # ── Auto-detect column names (Savant and FanGraphs use different names)
-            def _find_col(df, candidates):
-                for c in candidates:
-                    if c in df.columns:
-                        return c
-                    # case-insensitive
-                    matches = [x for x in df.columns if x.lower().replace(' ','_').replace('%','_pct') == c.lower().replace(' ','_').replace('%','_pct')]
-                    if matches:
-                        return matches[0]
-                return None
-
-            # Build a clean outcomes df with standardised column names
-            NAME_CANDS  = ['last_name, first_name', 'Name', 'PlayerName', 'player_name', 'name']
-            ID_CANDS    = ['pitcher', 'mlbam_id', 'IDfg', 'xMLBAMID', 'player_id']
-            STAT_MAP = {
-                'whiff_pct':  ['whiff_percent', 'Whiff%', 'whiff_pct', 'SwStr%'],
-                'k_pct':      ['k_percent', 'K%', 'k_pct'],
-                'bb_pct':     ['bb_percent', 'BB%', 'bb_pct'],
-                'gb_pct':     ['gb_percent', 'GB%', 'gb_pct'],
-                'fb_pct':     ['fb_percent', 'FB%', 'fb_pct'],
-                'xwoba':      ['est_woba', 'xwOBA', 'xwoba'],
-                'xera':       ['est_era', 'xERA', 'xera', 'xFIP'],
-                'barrel_pct': ['barrel_batted_rate', 'Barrel%', 'barrel_pct'],
-                'hard_hit_pct':['hard_hit_percent', 'Hard%', 'hard_hit_pct'],
-                'csw_pct':    ['CSW%', 'csw_pct'],
+            OUTCOME_LABELS = {
+                'k_pct':       'K%',
+                'bb_pct':      'BB%',
+                'whiff_pct':   'Whiff%',
+                'barrel_pct':  'Barrel%',
+                'hard_hit_pct':'Hard Hit%',
+                'xwoba':       'xwOBA',
+                'xera':        'xERA',
+                'xba':         'xBA',
             }
+            TUNNEL_COLS = {
+                'tunneling_plus':   'T+',
+                'avg_tunnel_ratio': 'Tunnel Ratio',
+                'n_speed_pairs':    'Speed Pairs',
+                'rc_val':           'Release Cons.',
+                'temporal':         'Temporal',
+                'n_tunnel_pairs':   'Tunnel Pairs',
+            }
+            avail_outcomes = {k: v for k, v in OUTCOME_LABELS.items()
+                              if k in merged.columns and merged[k].notna().sum() >= 5}
+            avail_tunnel   = {k: v for k, v in TUNNEL_COLS.items()
+                              if k in merged.columns}
 
-            name_col = _find_col(raw_outcomes, NAME_CANDS)
-            id_col   = _find_col(raw_outcomes, ID_CANDS)
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 1: Correlation matrix
+            # ══════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("#### League-Wide Correlations")
+            st.caption(f"Pearson r across {len(merged)} pitchers · 2026")
 
-            if name_col is None and id_col is None:
-                st.error(f"Could not find a name or ID column. Columns found: {raw_outcomes.columns.tolist()}")
-            else:
-                outcomes_clean = pd.DataFrame()
-                outcomes_clean['upload_name'] = raw_outcomes[name_col] if name_col else None
-                if id_col:
-                    outcomes_clean['pitcher_id'] = pd.to_numeric(raw_outcomes[id_col], errors='coerce')
+            corr_data = []
+            for tcol, tlabel in avail_tunnel.items():
+                row = {'Metric': tlabel}
+                for ocol, olabel in avail_outcomes.items():
+                    pair = merged[[tcol, ocol]].dropna()
+                    if len(pair) >= 8:
+                        row[olabel] = round(float(pair[tcol].corr(pair[ocol])), 3)
+                    else:
+                        row[olabel] = None
+                corr_data.append(row)
 
-                found_stats = []
-                for std_name, candidates in STAT_MAP.items():
-                    src = _find_col(raw_outcomes, candidates)
-                    if src:
-                        outcomes_clean[std_name] = pd.to_numeric(
-                            raw_outcomes[src].astype(str).str.replace('%','').str.strip(),
-                            errors='coerce'
-                        )
-                        found_stats.append(std_name)
+            corr_df = pd.DataFrame(corr_data).set_index('Metric')
 
-                st.caption(f"Detected stats: {', '.join(found_stats)}")
+            def _color_r(val):
+                if pd.isna(val): return 'color: #999'
+                if val >  0.3:  return 'background-color: #d4edda; color: #155724'
+                if val >  0.15: return 'background-color: #e8f5e9; color: #155724'
+                if val < -0.3:  return 'background-color: #f8d7da; color: #721c24'
+                if val < -0.15: return 'background-color: #fdecea; color: #721c24'
+                return ''
 
-                # ── Join to leaderboard ────────────────────────────────────────────
-                lb_corr = lb_filtered[
-                    ['pitcher_id', 'name', 'hand', 'team', 'pitches',
-                     'tunneling_plus', 'tp_pct',
-                     'avg_tunnel_ratio', 'tr_pct',
-                     'n_speed_pairs', 'spd_pct',
-                     'rc_val', 'rc_pct',
-                     'temporal', 'n_tunnel_pairs']
-                ].copy()
+            styled = corr_df.style.map(_color_r).format('{:.3f}', na_rep='—')
+            st.dataframe(styled, width='stretch')
+            st.caption(
+                "Green = positive correlation · Red = negative · "
+                "For xERA/xwOBA, negative r with T+ means better pitchers tunnel better"
+            )
 
-                # Try ID join first, fall back to name
-                if 'pitcher_id' in outcomes_clean.columns and outcomes_clean['pitcher_id'].notna().sum() > 5:
-                    merged = lb_corr.merge(outcomes_clean, on='pitcher_id', how='inner')
-                    join_method = 'pitcher_id'
-                else:
-                    # Normalise names for fuzzy match
-                    outcomes_clean['_norm'] = outcomes_clean['upload_name'].str.lower().str.strip()
-                    lb_corr['_norm'] = lb_corr['name'].str.lower().str.strip()
-                    merged = lb_corr.merge(outcomes_clean, on='_norm', how='inner')
-                    join_method = 'name'
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 2: Scatter explorer
+            # ══════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("#### Scatter Explorer")
 
-                st.caption(f"Matched {len(merged)} pitchers via {join_method}.")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                x_label = st.selectbox('X axis (tunneling metric)', list(avail_tunnel.values()), key='corr_x')
+            with sc2:
+                y_label = st.selectbox('Y axis (outcome)', list(avail_outcomes.values()), key='corr_y')
 
-                if len(merged) < 10:
-                    st.warning(
-                        f"Only {len(merged)} pitchers matched. "
-                        "If you used FanGraphs, pitcher names may differ slightly from Statcast names. "
-                        "Try a Baseball Savant export which uses MLBAM IDs for reliable matching."
-                    )
+            x_col = [k for k, v in avail_tunnel.items()   if v == x_label][0]
+            y_col = [k for k, v in avail_outcomes.items() if v == y_label][0]
+            scatter_df = merged[['name', 'team', 'hand', x_col, y_col]].dropna()
 
-                if len(merged) >= 5:
-                    OUTCOME_COLS = {k: k.replace('_pct','%').replace('_',' ').title()
-                                    for k in found_stats if k in merged.columns}
-                    OUTCOME_LABELS = {
-                        'whiff_pct': 'Whiff%', 'k_pct': 'K%', 'bb_pct': 'BB%',
-                        'gb_pct': 'GB%', 'fb_pct': 'FB%', 'xwoba': 'xwOBA',
-                        'xera': 'xERA', 'barrel_pct': 'Barrel%',
-                        'hard_hit_pct': 'Hard Hit%', 'csw_pct': 'CSW%',
-                    }
-                    avail_outcomes = {k: OUTCOME_LABELS.get(k, k) for k in found_stats if k in merged.columns and merged[k].notna().sum() >= 5}
-                    TUNNEL_COLS = {
-                        'tunneling_plus':  'T+',
-                        'avg_tunnel_ratio': 'Tunnel Ratio',
-                        'n_speed_pairs':   'Speed Pairs',
-                        'rc_val':          'Release Cons.',
-                        'temporal':        'Temporal',
-                        'n_tunnel_pairs':  'Tunnel Pairs',
-                    }
-                    avail_tunnel = {k: v for k, v in TUNNEL_COLS.items() if k in merged.columns}
+            if len(scatter_df) >= 5:
+                import json as _json
+                _x = scatter_df[x_col].values.astype(float)
+                _y = scatter_df[y_col].values.astype(float)
+                _r = float(pd.Series(_x).corr(pd.Series(_y)))
+                chart_data = [{'name': r['name'], 'team': r['team'], 'hand': r['hand'],
+                               'x': float(r[x_col]), 'y': float(r[y_col])}
+                              for _, r in scatter_df.iterrows()]
+                xmin, xmax = float(_x.min()), float(_x.max())
+                ymin, ymax = float(_y.min()), float(_y.max())
+                xpad, ypad = (xmax-xmin)*0.08 or 1, (ymax-ymin)*0.08 or 1
+                _c   = np.polyfit(_x, _y, 1)
+                tlx  = [xmin-xpad, xmax+xpad]
+                tly  = [float(_c[0]*v+_c[1]) for v in tlx]
 
-                    # ══════════════════════════════════════════════════════════════
-                    # SECTION 1: Correlation matrix
-                    # ══════════════════════════════════════════════════════════════
-                    st.markdown("---")
-                    st.markdown("#### League-Wide Correlations")
-                    st.caption(f"Pearson r across {len(merged)} matched pitchers · 2026")
-
-                    corr_data = []
-                    for tcol, tlabel in avail_tunnel.items():
-                        row = {'Metric': tlabel}
-                        for ocol, olabel in avail_outcomes.items():
-                            pair = merged[[tcol, ocol]].dropna()
-                            if len(pair) >= 8:
-                                r = float(pair[tcol].corr(pair[ocol]))
-                                row[olabel] = round(r, 3)
-                            else:
-                                row[olabel] = None
-                        corr_data.append(row)
-
-                    corr_df = pd.DataFrame(corr_data).set_index('Metric')
-
-                    def _color_r(val):
-                        if pd.isna(val): return 'color: #999'
-                        if val >  0.3:  return 'background-color: #d4edda; color: #155724'
-                        if val >  0.15: return 'background-color: #e8f5e9; color: #155724'
-                        if val < -0.3:  return 'background-color: #f8d7da; color: #721c24'
-                        if val < -0.15: return 'background-color: #fdecea; color: #721c24'
-                        return ''
-
-                    styled = corr_df.style.map(_color_r).format('{:.3f}', na_rep='—')
-                    st.dataframe(styled, width='stretch')
-                    st.caption(
-                        "Green = positive correlation · Red = negative · "
-                        "For xERA/xwOBA, negative r with T+ is good (lower = better for pitcher)"
-                    )
-
-                    # ══════════════════════════════════════════════════════════════
-                    # SECTION 2: Scatter explorer
-                    # ══════════════════════════════════════════════════════════════
-                    st.markdown("---")
-                    st.markdown("#### Scatter Explorer")
-
-                    sc1, sc2 = st.columns(2)
-                    with sc1:
-                        x_label = st.selectbox('X axis (tunneling metric)', list(avail_tunnel.values()), key='corr_x')
-                    with sc2:
-                        y_label = st.selectbox('Y axis (outcome)', list(avail_outcomes.values()), key='corr_y')
-
-                    x_col = [k for k, v in avail_tunnel.items()   if v == x_label][0]
-                    y_col = [k for k, v in avail_outcomes.items() if v == y_label][0]
-                    scatter_df = merged[['name', 'team', 'hand', x_col, y_col]].dropna()
-
-                    if len(scatter_df) >= 5:
-                        import json as _json
-                        _x  = scatter_df[x_col].values.astype(float)
-                        _y  = scatter_df[y_col].values.astype(float)
-                        _r  = float(pd.Series(_x).corr(pd.Series(_y)))
-                        chart_data = [{'name': r['name'], 'team': r['team'], 'hand': r['hand'],
-                                       'x': float(r[x_col]), 'y': float(r[y_col])}
-                                      for _, r in scatter_df.iterrows()]
-                        xmin, xmax = float(scatter_df[x_col].min()), float(scatter_df[x_col].max())
-                        ymin, ymax = float(scatter_df[y_col].min()), float(scatter_df[y_col].max())
-                        xpad = (xmax - xmin) * 0.08 or 1
-                        ypad = (ymax - ymin) * 0.08 or 1
-                        _c   = np.polyfit(_x, _y, 1)
-                        tlx  = [xmin - xpad, xmax + xpad]
-                        tly  = [float(_c[0]*v + _c[1]) for v in tlx]
-
-                        scatter_html = f"""
+                scatter_html = f"""
 <div style="font-family:sans-serif">
 <div style="margin-bottom:6px;color:#555;font-size:13px">r = <strong>{_r:+.3f}</strong> &nbsp;·&nbsp; n = {len(scatter_df)}</div>
 <div style="position:relative;width:100%;height:440px;background:#fafafa;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
@@ -1684,57 +1624,57 @@ with tab7:
   cv.addEventListener('mouseleave',()=>tip.style.display='none');
 }})();
 </script>"""
-                        st.components.v1.html(scatter_html, height=480)
-                        st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; Hover for name")
+                st.components.v1.html(scatter_html, height=480)
+                st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; Hover for name")
 
-                    # ══════════════════════════════════════════════════════════════
-                    # SECTION 3: Individual breakdown
-                    # ══════════════════════════════════════════════════════════════
-                    st.markdown("---")
-                    st.markdown("#### Individual Pitcher Breakdown")
-                    st.caption("Expected outcome range from regression vs. actual results. Only |r| ≥ 0.10 shown.")
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 3: Individual breakdown
+            # ══════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("#### Individual Pitcher Breakdown")
+            st.caption("Expected outcome range from regression vs. actual results. Only |r| ≥ 0.10 shown.")
 
-                    all_names_corr = sorted(merged['name'].dropna().unique().tolist())
-                    _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
-                    _idx = all_names_corr.index(_def) if _def in all_names_corr else 0
-                    sel  = st.selectbox('Select pitcher', all_names_corr, index=_idx, key='corr_sel')
+            all_names_corr = sorted(merged['name'].dropna().unique().tolist())
+            _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
+            _idx = all_names_corr.index(_def) if _def in all_names_corr else 0
+            sel  = st.selectbox('Select pitcher', all_names_corr, index=_idx, key='corr_sel')
 
-                    if sel:
-                        pr = merged[merged['name'] == sel].iloc[0]
-                        st.markdown(f"**{sel}** &nbsp;·&nbsp; {pr.get('team','')} &nbsp;·&nbsp; {pr.get('hand','')}HP")
-                        rows_bd = []
-                        for tcol, tlabel in avail_tunnel.items():
-                            for ocol, olabel in avail_outcomes.items():
-                                pair = merged[[tcol, ocol]].dropna()
-                                if len(pair) < 8: continue
-                                r = float(pair[tcol].corr(pair[ocol]))
-                                if abs(r) < 0.10: continue
-                                _xv = pair[tcol].values.astype(float)
-                                _yv = pair[ocol].values.astype(float)
-                                _m, _b = float(np.polyfit(_xv, _yv, 1))
-                                pred = _m * float(pr[tcol]) + _b
-                                sd   = float(np.std(_yv - (_m * _xv + _b)))
-                                actual = pr.get(ocol, None)
-                                if pd.isna(actual): continue
-                                actual = float(actual)
-                                _low = ocol in ('xwoba', 'xera', 'barrel_pct', 'bb_pct')
-                                if _low:
-                                    verdict = '✅ Better' if actual < pred - sd else ('⚠️ Worse' if actual > pred + sd else '➖ In range')
-                                else:
-                                    verdict = '✅ Better' if actual > pred + sd else ('⚠️ Worse' if actual < pred - sd else '➖ In range')
-                                rows_bd.append({
-                                    'Tunnel Metric': tlabel, 'Outcome': olabel,
-                                    'r': round(r, 3), 'Predicted': round(pred, 3),
-                                    'Exp Range': f'{pred-sd:.2f} – {pred+sd:.2f}',
-                                    'Actual': round(actual, 3), 'vs Expected': verdict,
-                                })
-                        if rows_bd:
-                            bd_df = pd.DataFrame(rows_bd).sort_values(['Outcome','Tunnel Metric'])
-                            st.dataframe(bd_df, hide_index=True, width='stretch',
-                                column_config={
-                                    'r':         st.column_config.NumberColumn('Pearson r', format='%.3f', width='small'),
-                                    'Predicted': st.column_config.NumberColumn(format='%.3f', width='small'),
-                                    'Actual':    st.column_config.NumberColumn(format='%.3f', width='small'),
-                                })
+            if sel:
+                pr = merged[merged['name'] == sel].iloc[0]
+                st.markdown(f"**{sel}** &nbsp;·&nbsp; {pr.get('team','')} &nbsp;·&nbsp; {pr.get('hand','')}HP")
+                rows_bd = []
+                for tcol, tlabel in avail_tunnel.items():
+                    for ocol, olabel in avail_outcomes.items():
+                        pair = merged[[tcol, ocol]].dropna()
+                        if len(pair) < 8: continue
+                        r = float(pair[tcol].corr(pair[ocol]))
+                        if abs(r) < 0.10: continue
+                        _xv = pair[tcol].values.astype(float)
+                        _yv = pair[ocol].values.astype(float)
+                        _m, _b = float(np.polyfit(_xv, _yv, 1))
+                        pred   = _m * float(pr[tcol]) + _b
+                        sd     = float(np.std(_yv - (_m * _xv + _b)))
+                        actual = pr.get(ocol, None)
+                        if pd.isna(actual): continue
+                        actual = float(actual)
+                        _low = ocol in ('xwoba', 'xera', 'barrel_pct', 'bb_pct')
+                        if _low:
+                            verdict = '✅ Better' if actual < pred-sd else ('⚠️ Worse' if actual > pred+sd else '➖ In range')
                         else:
-                            st.info("No correlations strong enough (|r| ≥ 0.10) to show for this pitcher.")
+                            verdict = '✅ Better' if actual > pred+sd else ('⚠️ Worse' if actual < pred-sd else '➖ In range')
+                        rows_bd.append({
+                            'Tunnel Metric': tlabel, 'Outcome': olabel,
+                            'r': round(r,3), 'Predicted': round(pred,3),
+                            'Exp Range': f'{pred-sd:.2f} – {pred+sd:.2f}',
+                            'Actual': round(actual,3), 'vs Expected': verdict,
+                        })
+                if rows_bd:
+                    bd_df = pd.DataFrame(rows_bd).sort_values(['Outcome','Tunnel Metric'])
+                    st.dataframe(bd_df, hide_index=True, width='stretch',
+                        column_config={
+                            'r':         st.column_config.NumberColumn('Pearson r', format='%.3f', width='small'),
+                            'Predicted': st.column_config.NumberColumn(format='%.3f', width='small'),
+                            'Actual':    st.column_config.NumberColumn(format='%.3f', width='small'),
+                        })
+                else:
+                    st.info("No correlations strong enough (|r| ≥ 0.10) for this pitcher.")
