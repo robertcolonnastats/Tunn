@@ -1520,7 +1520,7 @@ with tab7:
                 all_names_corr = sorted(merged['name'].dropna().unique().tolist())
                 _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
                 _idx = all_names_corr.index(_def) if _def in all_names_corr else 0
-                hl_pitcher = st.selectbox('Highlight pitcher', ['(none)'] + all_names_corr, index=_idx + 1, key='corr_hl')
+                hl_pitcher = st.selectbox('View pitcher (or All pitchers)', ['(none)'] + all_names_corr, index=_idx + 1, key='corr_hl')
 
             x_col = [k for k, v in avail_tunnel.items()   if v == x_label][0]
             y_col = [k for k, v in avail_outcomes.items() if v == y_label][0]
@@ -1531,44 +1531,58 @@ with tab7:
             # ══════════════════════════════════════════════════════════════════
             st.markdown("---")
             st.markdown("#### Scatter Explorer")
-            st.markdown(
-                "Each dot is one pitcher. The dashed line is the best-fit trend — "
-                "a steep slope means that tunneling metric is a strong predictor of that outcome. "
-                "Hover to see any pitcher. Use **Highlight pitcher** above to call one out specifically."
-            )
+
+            _solo_mode = hl_pitcher != '(none)'
+
+            if _solo_mode:
+                st.markdown(
+                    f"Showing **{hl_pitcher}**'s values for {x_label} and {y_label}. "
+                    "The dot is placed against the league trendline so you can see where they sit. "
+                    "Switch to **All pitchers** above to see the full scatter."
+                )
+            else:
+                st.markdown(
+                    "Each dot is one pitcher. The dashed line is the best-fit trend — "
+                    "a steep slope means that tunneling metric is a strong predictor of that outcome. "
+                    "Hover for details. Select a pitcher above to isolate them."
+                )
 
             if len(scatter_df) >= 5:
                 import json as _json
-                _x  = scatter_df[x_col].values.astype(float)
-                _y  = scatter_df[y_col].values.astype(float)
-                _r  = float(pd.Series(_x).corr(pd.Series(_y)))
-                _c  = np.polyfit(_x, _y, 1)
-                xmin, xmax = float(_x.min()), float(_x.max())
-                ymin, ymax = float(_y.min()), float(_y.max())
+                # Always compute trendline from full pool
+                _x_all = scatter_df[x_col].values.astype(float)
+                _y_all = scatter_df[y_col].values.astype(float)
+                _r     = float(pd.Series(_x_all).corr(pd.Series(_y_all)))
+                _c     = np.polyfit(_x_all, _y_all, 1)
+                xmin, xmax = float(_x_all.min()), float(_x_all.max())
+                ymin, ymax = float(_y_all.min()), float(_y_all.max())
                 xpad = (xmax - xmin) * 0.1 or 1
                 ypad = (ymax - ymin) * 0.1 or 1
                 tlx = [xmin - xpad, xmax + xpad]
                 tly = [float(_c[0]*v + _c[1]) for v in tlx]
 
-                # Mark the highlighted pitcher
-                hl_row = None
-                if hl_pitcher != '(none)':
+                if _solo_mode:
+                    # Solo view: just the one pitcher dot + trendline for context
                     _hl = scatter_df[scatter_df['name'] == hl_pitcher]
-                    if not _hl.empty:
-                        hl_row = {'name': hl_pitcher,
-                                  'x': float(_hl[x_col].iloc[0]),
-                                  'y': float(_hl[y_col].iloc[0]),
-                                  'team': str(_hl['team'].iloc[0]),
-                                  'hand': str(_hl['hand'].iloc[0])}
-
-                chart_data = [{'name': row['name'], 'team': row['team'], 'hand': row['hand'],
-                               'x': float(row[x_col]), 'y': float(row[y_col]),
-                               'hl': row['name'] == hl_pitcher}
-                              for _, row in scatter_df.iterrows()]
+                    if _hl.empty:
+                        st.warning(f"{hl_pitcher} not found in matched data.")
+                        chart_data = []
+                    else:
+                        chart_data = [{'name': hl_pitcher,
+                                       'x': float(_hl[x_col].iloc[0]),
+                                       'y': float(_hl[y_col].iloc[0]),
+                                       'team': str(_hl['team'].iloc[0]),
+                                       'hand': str(_hl['hand'].iloc[0]),
+                                       'hl': True}]
+                else:
+                    chart_data = [{'name': row['name'], 'team': row['team'], 'hand': row['hand'],
+                                   'x': float(row[x_col]), 'y': float(row[y_col]),
+                                   'hl': False}
+                                  for _, row in scatter_df.iterrows()]
 
                 scatter_html = f"""
 <div style="font-family:sans-serif">
-<div style="margin-bottom:6px;color:#555;font-size:13px">r = <strong>{_r:+.3f}</strong> &nbsp;·&nbsp; n = {len(scatter_df)}{f' &nbsp;·&nbsp; <span style="color:#e07b00;font-weight:600">▶ {hl_pitcher}</span>' if hl_pitcher != '(none)' else ''}</div>
+<div style="margin-bottom:6px;color:#555;font-size:13px">r = <strong>{_r:+.3f}</strong> &nbsp;·&nbsp; n = {len(scatter_df)}{f' &nbsp;·&nbsp; <span style="color:#e07b00;font-weight:600">▶ {hl_pitcher}</span>' if _solo_mode else ''}</div>
 <div style="position:relative;width:100%;height:460px;background:#fafafa;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
 <canvas id="scMain" width="820" height="460" style="width:100%;height:100%"></canvas>
 <div id="ttMain" style="position:absolute;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:6px 10px;font-size:12px;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.15)"></div>
@@ -1576,7 +1590,8 @@ with tab7:
 <script>
 (function(){{
   const pts={_json.dumps(chart_data)},tlX={_json.dumps(tlx)},tlY={_json.dumps(tly)};
-  const xL={_json.dumps(x_label)},yL={_json.dumps(y_label)},hlName={_json.dumps(hl_pitcher)};
+  const xL={_json.dumps(x_label)},yL={_json.dumps(y_label)};
+  const soloMode={_json.dumps(_solo_mode)};
   const xMn={xmin-xpad},xMx={xmax+xpad},yMn={ymin-ypad},yMx={ymax+ypad};
   const cv=document.getElementById('scMain'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height;
   const P={{l:64,r:24,t:24,b:54}};
@@ -1601,48 +1616,66 @@ with tab7:
     const xv=xMn+i*(xMx-xMn)/5;ctx.textAlign='center';ctx.fillText(xv.toFixed(2),tx(xv),H-P.b+14);
     const yv=yMn+i*(yMx-yMn)/5;ctx.textAlign='right';ctx.fillText(yv.toFixed(2),P.l-5,ty(yv)+4);
   }}
-  // trendline
-  ctx.strokeStyle='rgba(200,80,80,.5)';ctx.lineWidth=1.5;ctx.setLineDash([6,4]);
+  // trendline (always drawn for context)
+  ctx.strokeStyle='rgba(200,80,80,.45)';ctx.lineWidth=1.5;ctx.setLineDash([6,4]);
   ctx.beginPath();ctx.moveTo(tx(tlX[0]),ty(tlY[0]));ctx.lineTo(tx(tlX[1]),ty(tlY[1]));ctx.stroke();
   ctx.setLineDash([]);
-  // draw non-highlighted first, then highlighted on top
-  pts.filter(p=>!p.hl).forEach(p=>{{
-    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),4.5,0,Math.PI*2);
-    ctx.fillStyle=p.hand==='L'?'rgba(59,130,246,.55)':'rgba(16,185,129,.55)';
-    ctx.strokeStyle=p.hand==='L'?'#3b82f6':'#10b981';ctx.lineWidth=.8;
-    ctx.fill();ctx.stroke();
-  }});
-  pts.filter(p=>p.hl).forEach(p=>{{
+  if(soloMode && pts.length===1){{
+    const p=pts[0];
+    const px=tx(p.x),py=ty(p.y);
+    // crosshairs
+    ctx.strokeStyle='rgba(224,123,0,.25)';ctx.lineWidth=1;ctx.setLineDash([4,3]);
+    ctx.beginPath();ctx.moveTo(px,P.t);ctx.lineTo(px,H-P.b);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(P.l,py);ctx.lineTo(W-P.r,py);ctx.stroke();
+    ctx.setLineDash([]);
     // halo
-    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),11,0,Math.PI*2);
-    ctx.fillStyle='rgba(230,120,0,.18)';ctx.fill();
+    ctx.beginPath();ctx.arc(px,py,18,0,Math.PI*2);
+    ctx.fillStyle='rgba(224,123,0,.12)';ctx.fill();
     // dot
-    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),7,0,Math.PI*2);
-    ctx.fillStyle='#e07b00';ctx.strokeStyle='#a05000';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.arc(px,py,10,0,Math.PI*2);
+    ctx.fillStyle='#e07b00';ctx.strokeStyle='#a05000';ctx.lineWidth=2;
     ctx.fill();ctx.stroke();
-    // label
-    ctx.fillStyle='#a05000';ctx.font='bold 11px sans-serif';ctx.textAlign='left';
-    const lx=tx(p.x)+10, ly=ty(p.y)-6;
-    ctx.fillText(p.name,lx,ly);
-  }});
-  // tooltip
+    // name label above dot
+    ctx.fillStyle='#7a3a00';ctx.font='bold 13px sans-serif';ctx.textAlign='center';
+    ctx.fillText(p.name,px,py-22);
+    // value labels on axes
+    ctx.fillStyle='#e07b00';ctx.font='bold 11px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText(p.x.toFixed(3),px,H-P.b+28);
+    ctx.textAlign='right';
+    ctx.fillText(p.y.toFixed(3),P.l-5,py-8);
+  }}else{{
+    // all-pitchers mode
+    pts.forEach(p=>{{
+      ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),4.5,0,Math.PI*2);
+      ctx.fillStyle=p.hand==='L'?'rgba(59,130,246,.55)':'rgba(16,185,129,.55)';
+      ctx.strokeStyle=p.hand==='L'?'#3b82f6':'#10b981';ctx.lineWidth=.8;
+      ctx.fill();ctx.stroke();
+    }});
+  }}
+  // tooltip (all-pitchers mode only)
   const tip=document.getElementById('ttMain');
-  cv.addEventListener('mousemove',function(e){{
-    const rc=cv.getBoundingClientRect(),sx=cv.width/rc.width,sy=cv.height/rc.height;
-    const mx=(e.clientX-rc.left)*sx,my=(e.clientY-rc.top)*sy;
-    let hit=null,bestD=12;
-    pts.forEach(p=>{{const dx=tx(p.x)-mx,dy=ty(p.y)-my,d=Math.sqrt(dx*dx+dy*dy);if(d<bestD){{bestD=d;hit=p;}}}});
-    if(hit){{
-      tip.style.display='block';
-      tip.style.left=(e.clientX-rc.left+14)+'px';tip.style.top=(e.clientY-rc.top-24)+'px';
-      tip.innerHTML=`<strong>${{hit.name}}</strong> (${{hit.team}} · ${{hit.hand}}HP)<br>${{xL}}: ${{hit.x.toFixed(3)}}<br>${{yL}}: ${{hit.y.toFixed(3)}}`;
-    }}else tip.style.display='none';
-  }});
-  cv.addEventListener('mouseleave',()=>tip.style.display='none');
+  if(!soloMode){{
+    cv.addEventListener('mousemove',function(e){{
+      const rc=cv.getBoundingClientRect(),sx=cv.width/rc.width,sy=cv.height/rc.height;
+      const mx=(e.clientX-rc.left)*sx,my=(e.clientY-rc.top)*sy;
+      let hit=null,bestD=12;
+      pts.forEach(p=>{{const dx=tx(p.x)-mx,dy=ty(p.y)-my,d=Math.sqrt(dx*dx+dy*dy);if(d<bestD){{bestD=d;hit=p;}}}});
+      if(hit){{
+        tip.style.display='block';
+        tip.style.left=(e.clientX-rc.left+14)+'px';tip.style.top=(e.clientY-rc.top-24)+'px';
+        tip.innerHTML=`<strong>${{hit.name}}</strong> (${{hit.team}} · ${{hit.hand}}HP)<br>${{xL}}: ${{hit.x.toFixed(3)}}<br>${{yL}}: ${{hit.y.toFixed(3)}}`;
+      }}else tip.style.display='none';
+    }});
+    cv.addEventListener('mouseleave',()=>tip.style.display='none');
+  }}
 }})();
 </script>"""
                 st.components.v1.html(scatter_html, height=500)
-                st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; 🟠 Highlighted pitcher &nbsp;·&nbsp; Hover for details")
+                if _solo_mode:
+                    st.caption(f"🟠 {hl_pitcher} &nbsp;·&nbsp; Trendline shows league average relationship")
+                else:
+                    st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; Hover for details")
 
             # ══════════════════════════════════════════════════════════════════
             # SECTION 2: League correlation table (same outcome as scatter)
