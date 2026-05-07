@@ -726,549 +726,92 @@ def load_season_data(start: str, end: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_outcome_data(season: int):
-    """Pull outcome stats from Baseball Savant via pybaseball.
-    Uses the same baseballsavant.mlb.com domain as the main data load,
-    so this works on Streamlit Cloud. Two sources merged on pitcher_id:
-      - statcast_pitcher_exitvelo_barrels: K%, BB%, whiff%, barrel%, hard hit%
-      - statcast_pitcher_expected_stats:   xwOBA, xERA, xBA, xSLG
+    """Pull outcome stats from Baseball Savant via pybaseball (same domain as main load).
+    Three sources merged on pitcher MLBAM id:
+      - statcast_pitcher_exitvelo_barrels : K%, BB%, Whiff%, Barrel%, Hard Hit%
+      - statcast_pitcher_expected_stats   : xwOBA, xERA, xBA
+      - statcast_pitcher_pitch_arsenal    : Chase%, GB%, O-Swing%, Z-Contact%
     """
     try:
         from pybaseball import (
             statcast_pitcher_exitvelo_barrels as _evb,
             statcast_pitcher_expected_stats   as _exp,
+            statcast_pitcher_pitch_arsenal    as _ars,
         )
-        # Statcast leaderboard — K%, BB%, whiff%, barrel%, hard_hit%
-        ev = _evb(season, minBBE=25)
-        ev.columns = [c.lower().strip() for c in ev.columns]
-        # Expected stats — xwOBA, xERA, xBA
-        ex = _exp(season, minPA=25)
-        ex.columns = [c.lower().strip() for c in ex.columns]
 
-        # Both have a 'pitcher' MLBAM id column and 'player_name'
-        # Standardise id column name
-        for df in (ev, ex):
-            if 'pitcher' in df.columns:
-                df.rename(columns={'pitcher': 'pitcher_id'}, inplace=True)
-            elif 'player_id' in df.columns:
-                df.rename(columns={'player_id': 'pitcher_id'}, inplace=True)
+        def _prep(df):
+            df = df.copy()
+            df.columns = [c.lower().strip() for c in df.columns]
+            for id_col in ('pitcher', 'player_id', 'mlbam_id'):
+                if id_col in df.columns:
+                    df.rename(columns={id_col: 'pitcher_id'}, inplace=True)
+                    break
             df['pitcher_id'] = pd.to_numeric(df['pitcher_id'], errors='coerce')
+            return df
 
-        # Columns we want from each source
-        EV_COLS = {
-            'k_percent':        'k_pct',
-            'bb_percent':       'bb_pct',
-            'whiff_percent':    'whiff_pct',
+        ev = _prep(_evb(season, minBBE=25))
+        ex = _prep(_exp(season, minPA=25))
+        # pitch_arsenal has one row per pitcher per pitch type — aggregate to pitcher level
+        ar_raw = _prep(_ars(season, minP=50, arsenal_type='n_'))
+        # columns of interest from arsenal: gb_percent, o_swing_percent, z_contact_percent, whiff_percent
+        # aggregate by pitcher_id (mean across pitch types, weighted by pitch count if available)
+        ar_cols = [c for c in ar_raw.columns if c in (
+            'gb_percent','o_swing_percent','z_contact_percent',
+            'whiff_percent','chase_percent','csw_percent',
+        )]
+        if ar_cols and 'pitcher_id' in ar_raw.columns:
+            ar = ar_raw.groupby('pitcher_id')[ar_cols].mean().reset_index()
+        else:
+            ar = pd.DataFrame(columns=['pitcher_id'])
+
+        # Column rename maps
+        EV_MAP = {
+            'k_percent':         'k_pct',
+            'bb_percent':        'bb_pct',
+            'whiff_percent':     'whiff_pct',
             'barrel_batted_rate':'barrel_pct',
-            'hard_hit_percent': 'hard_hit_pct',
+            'hard_hit_percent':  'hard_hit_pct',
         }
-        EX_COLS = {
-            'est_woba':         'xwoba',
-            'est_era':          'xera',
-            'est_ba':           'xba',
+        EX_MAP = {
+            'est_woba': 'xwoba',
+            'est_era':  'xera',
+            'est_ba':   'xba',
+        }
+        AR_MAP = {
+            'gb_percent':         'gb_pct',
+            'o_swing_percent':    'o_swing_pct',
+            'z_contact_percent':  'z_contact_pct',
+            'whiff_percent':      'whiff_pct_ar',  # deduplicate if both sources have it
+            'chase_percent':      'chase_pct',
+            'csw_percent':        'csw_pct',
         }
 
-        ev_keep = ['pitcher_id'] + [c for c in EV_COLS if c in ev.columns]
-        ex_keep = ['pitcher_id'] + [c for c in EX_COLS if c in ex.columns]
+        def _slim(df, col_map):
+            keep = ['pitcher_id'] + [c for c in col_map if c in df.columns]
+            return df[keep].rename(columns=col_map)
 
-        ev_clean = ev[ev_keep].rename(columns=EV_COLS)
-        ex_clean = ex[ex_keep].rename(columns=EX_COLS)
+        ev_c = _slim(ev, EV_MAP)
+        ex_c = _slim(ex, EX_MAP)
+        ar_c = _slim(ar, AR_MAP)
 
-        merged = ev_clean.merge(ex_clean, on='pitcher_id', how='outer')
+        out = ev_c.merge(ex_c, on='pitcher_id', how='outer')                   .merge(ar_c, on='pitcher_id', how='outer')
 
-        # Convert all stat cols to numeric
-        for col in merged.columns:
+        # Prefer ev whiff_pct; if ar also has it, drop the duplicate
+        if 'whiff_pct' in out.columns and 'whiff_pct_ar' in out.columns:
+            out['whiff_pct'] = out['whiff_pct'].fillna(out['whiff_pct_ar'])
+            out.drop(columns=['whiff_pct_ar'], inplace=True)
+
+        for col in out.columns:
             if col != 'pitcher_id':
-                merged[col] = pd.to_numeric(
-                    merged[col].astype(str).str.replace('%','').str.strip(),
+                out[col] = pd.to_numeric(
+                    out[col].astype(str).str.replace('%','').str.strip(),
                     errors='coerce'
                 )
-        return merged
+        return out
 
     except Exception as _e:
-        # Return empty df — tab will show a clear error message
         import traceback
         return pd.DataFrame({'_error': [str(_e)], '_tb': [traceback.format_exc()]})
-
-# Use sys.modules to store results — truly process-global, survives reruns.
-import threading, time as _time, sys as _sys
-
-_STORE_KEY = '__tplus_data_store__'
-if _STORE_KEY not in _sys.modules:
-    _sys.modules[_STORE_KEY] = {}
-_tplus_store = _sys.modules[_STORE_KEY]
-
-_cache_key  = f'data_{start_str}_{end_str}'
-_err_key    = f'err_{start_str}_{end_str}'
-_thread_key = f'thread_{start_str}_{end_str}'
-_t0_key     = f't0_{start_str}_{end_str}'
-
-# ── Evict any OTHER season's data immediately so we never hold two seasons
-#    in RAM at the same time. Do this before starting the new thread.
-for _stale_key in [k for k in list(_tplus_store.keys())
-                   if k.startswith('data_') and k != _cache_key]:
-    del _tplus_store[_stale_key]
-# Also cancel any stale threads from other seasons (they're daemon threads
-# so they'll die naturally, but clear their keys so UI doesn't get confused).
-for _stale_k in [k for k in list(_tplus_store.keys())
-                 if (k.startswith('thread_') or k.startswith('err_') or k.startswith('t0_'))
-                 and not k.endswith(f'_{start_str}_{end_str}')]:
-    _tplus_store.pop(_stale_k, None)
-
-# Start background thread if result not yet available and no thread running
-if _cache_key not in _tplus_store:
-    _existing_thread = _tplus_store.get(_thread_key)
-    _thread_running  = _existing_thread is not None and _existing_thread.is_alive()
-    if not _thread_running and _err_key not in _tplus_store:
-        def _load_in_background():
-            try:
-                _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
-            except Exception as exc:
-                _tplus_store[_err_key] = exc
-
-        _t = threading.Thread(target=_load_in_background, daemon=True)
-        _tplus_store[_thread_key] = _t
-        _tplus_store[_t0_key]     = _time.time()
-        _t.start()
-
-# Poll: show status and rerun
-if _cache_key not in _tplus_store:
-    _thread_done = (
-        _tplus_store.get(_thread_key) is not None
-        and not _tplus_store[_thread_key].is_alive()
-    )
-    _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
-
-    # Error recorded by thread
-    if _err_key in _tplus_store:
-        _err = _tplus_store[_err_key]
-        st.error(f'Failed to load data: {_err}')
-        st.exception(_err)
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-
-    # Hard timeout — 8 minutes
-    if _elapsed > 480:
-        st.error(f'Data load timed out after {_elapsed}s. Try a shorter date range or click Retry.')
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-
-    # Thread done but no result and no error
-    if _thread_done:
-        st.error(
-            'Data load thread finished without a result. '
-            f'Store keys: {list(_tplus_store.keys())}. '
-            'This may be a pybaseball connectivity issue.'
-        )
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-
-    st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
-    _time.sleep(2)
-    st.rerun()
-
-if _err_key in _tplus_store:
-    st.error(f'Failed to load data: {_tplus_store[_err_key]}')
-    st.exception(_tplus_store[_err_key])
-    st.stop()
-
-lb, pools = _tplus_store[_cache_key]
-
-# Filter and rerank
-lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
-lb_filtered['rank'] = lb_filtered['tunneling_plus'].rank(
-    ascending=False, method='min').astype(int)
-lb_filtered['tp_pct'] = lb_filtered['tunneling_plus'].rank(
-    pct=True).mul(100).round(0).astype(int)
-
-# ── Compute percentile columns for leaderboard display ────────────────────────
-# Tunnel ratio percentile (higher = better)
-lb_filtered['tr_pct'] = lb_filtered['avg_tunnel_ratio'].rank(
-    pct=True).mul(100).round(0).astype(int)
-
-# Speed-change percentile (higher n_speed_pairs = better)
-lb_filtered['spd_pct'] = lb_filtered['n_speed_pairs'].rank(
-    pct=True).mul(100).round(0).astype(int)
-
-# Release consistency: compute per-pitcher weighted avg release distance from pools
-# Lower rd = tighter release = better, so we invert the percentile
-def _compute_rc(pools_df, pitcher_ids):
-    from itertools import combinations as _comb
-    rc_map = {}
-    for pid, grp in pools_df.groupby('pitcher_id'):
-        if pid not in pitcher_ids:
-            continue
-        grp = grp[grp['pitches'] >= 10].copy()
-        if len(grp) < 2:
-            continue
-        total = grp['pitches'].sum()
-        grp['pitch_frac'] = grp['pitches'] / total
-        rc_w = []
-        for (_, r1), (_, r2) in _comb(grp.iterrows(), 2):
-            if 'rel_x' not in r1 or 'rel_x' not in r2:
-                continue
-            rd = float(np.sqrt((r1['rel_x']-r2['rel_x'])**2+(r1['rel_z']-r2['rel_z'])**2))
-            uw = float(r1['pitch_frac'] * r2['pitch_frac'])
-            rc_w.append((rd, uw))
-        if rc_w:
-            tw = sum(x[1] for x in rc_w)
-            rc_map[pid] = sum(x[0]*x[1] for x in rc_w) / tw
-    return rc_map
-
-_rc_map = _compute_rc(pools, set(lb_filtered['pitcher_id'].tolist()))
-lb_filtered['rc_val'] = lb_filtered['pitcher_id'].map(_rc_map)
-# Invert: lower release distance = higher percentile (tighter = better)
-lb_filtered['rc_pct'] = (
-    lb_filtered['rc_val'].rank(pct=True, ascending=False)
-    .mul(100).round(0).fillna(50).astype(int)
-)
-
-for hand in ['R', 'L']:
-    mask = lb_filtered['hand'] == hand
-    lb_filtered.loc[mask, 'total_hand'] = int(mask.sum())
-
-total_q = len(lb_filtered)
-st.success(
-    f'✓ {total_q} pitchers · {start_str} → {end_str} · '
-    f'Loaded {datetime.now(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p")} EST'
-)
-
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ['📊 Leaderboard', '🃏 Player Card', '📥 Export', '🔬 Diagnostic', '📖 Methodology', '🔍 Tunnel Comps', '📈 Correlations']
-)
-
-# ─── Tab 1: Leaderboard ───────────────────────────────────────────────────────
-with tab1:
-    st.caption(f'Season {season} · {start_str} → {end_str} · Model v18 (Statcast)')
-
-    fc1, fc2, fc3 = st.columns([3, 1, 1])
-    with fc1:
-        all_names   = sorted(lb_filtered['name'].dropna().unique().tolist())
-        name_filter = st.multiselect('Search pitchers', all_names, placeholder='Type to search…')
-    with fc2:
-        teams    = ['All'] + sorted(lb_filtered['team'].dropna().unique().tolist())
-        team_sel = st.selectbox('Team', teams)
-    with fc3:
-        hand_sel = st.selectbox('Hand', ['All', 'R', 'L'])
-
-    display = lb_filtered.copy()
-    if name_filter:
-        display = display[display['name'].isin(name_filter)]
-    if team_sel != 'All':
-        display = display[display['team'] == team_sel]
-    if hand_sel != 'All':
-        display = display[display['hand'] == hand_sel]
-
-    show_cols = ['rank', 'tunneling_plus', 'tp_pct', 'name', 'team', 'hand',
-                 'pitches',
-                 'avg_tunnel_ratio', 'tr_pct',
-                 'n_speed_pairs',    'spd_pct',
-                 'rc_val',           'rc_pct']
-    col_names = {
-        'rank': 'Rank', 'tunneling_plus': 'T+', 'tp_pct': 'Pct',
-        'name': 'Pitcher', 'team': 'Team', 'hand': 'Hand',
-        'pitches': 'Pitches',
-        'avg_tunnel_ratio': 'Tun Ratio', 'tr_pct':  'TR Pct',
-        'n_speed_pairs':    'Spd Pairs', 'spd_pct': 'Spd Pct',
-        'rc_val':           'Rel Cons',  'rc_pct':  'RC Pct',
-    }
-    disp = display[show_cols].rename(columns=col_names)
-    st.dataframe(
-        disp,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            'Rank':     st.column_config.NumberColumn(width='small'),
-            'T+':       st.column_config.NumberColumn(format='%.1f', width='small'),
-            'Pct':      st.column_config.NumberColumn(format='%d',   width='small'),
-            'Pitcher':  st.column_config.TextColumn(width='medium'),
-            'Team':     st.column_config.TextColumn(width='small'),
-            'Hand':     st.column_config.TextColumn(width='small'),
-            'Pitches':  st.column_config.NumberColumn(width='small'),
-            'Tun Ratio':st.column_config.NumberColumn(format='%.3f', width='medium'),
-            'TR Pct':   st.column_config.NumberColumn(format='%d',   width='small'),
-            'Spd Pairs':st.column_config.NumberColumn(width='small'),
-            'Spd Pct':  st.column_config.NumberColumn(format='%d',   width='small'),
-            'Rel Cons': st.column_config.NumberColumn(format='%.2f', width='medium'),
-            'RC Pct':   st.column_config.NumberColumn(format='%d',   width='small'),
-        }
-    )
-    st.caption(f'Showing {len(disp)} of {total_q} qualified pitchers')
-
-    # Quick-nav to Player Card
-    if len(display) <= 20:
-        nav_names = display['name'].tolist()
-        if nav_names:
-            st.markdown('**→ Player Card:**')
-            nav_cols = st.columns(min(len(nav_names), 5))
-            for i, pname in enumerate(nav_names[:10]):
-                with nav_cols[i % 5]:
-                    if st.button(pname, key=f'nav_{pname}'):
-                        st.session_state['selected_pitcher'] = pname
-                        st.session_state['active_tab'] = 1
-
-# ─── Tab 2: Player Card ───────────────────────────────────────────────────────
-with tab2:
-    pitcher_names   = lb_filtered['name'].sort_values().tolist()
-    _default_pitcher = st.session_state.get('selected_pitcher', pitcher_names[0] if pitcher_names else None)
-    _default_idx    = pitcher_names.index(_default_pitcher) if _default_pitcher in pitcher_names else 0
-    selected = st.selectbox('Select pitcher', pitcher_names, index=_default_idx)
-    # Clear nav state after use
-    if 'selected_pitcher' in st.session_state:
-        del st.session_state['selected_pitcher']
-
-    playwright_ok = True
-    try:
-        from playwright.async_api import async_playwright  # noqa
-    except ImportError:
-        playwright_ok = False
-
-    if selected:
-        lb_row = lb_filtered[lb_filtered['name'] == selected].iloc[0]
-
-        if not playwright_ok:
-            st.warning(
-                'Playwright or Chromium not available — showing text card only. '
-                'Run `pip install playwright && playwright install chromium` for JPG cards.'
-            )
-            tp  = lb_row['tunneling_plus']
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric('T+', f'{tp:.1f}')
-            c2.metric('Percentile', f'{int(lb_row["tp_pct"])}th')
-            c3.metric('Tunnel Pairs', int(lb_row['n_tunnel_pairs']))
-            c4.metric('Avg Ratio', f'{lb_row["avg_tunnel_ratio"]:.3f}x')
-            details = lb_row.get('pitch_details', [])
-            if isinstance(details, str): details = json.loads(details)
-            if details:
-                adf = pd.DataFrame(sorted(details, key=lambda x: -x['frac']))
-                adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
-                                          'ivb':'IVB','hb':'HB','frac':'Usage%'})
-                cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
-                st.dataframe(adf[cols], width="stretch", hide_index=True)
-        else:
-            with st.spinner(f'Rendering card for {selected}…'):
-                try:
-                    league_pools = get_league_pools(start_str, end_str)
-                    info         = get_pitcher_card_info(selected, lb_row, pools, league_pools)
-                    if info is None:
-                        st.error(f'No pitch-level data found for {selected}.')
-                    else:
-                        html      = make_card_html(info)
-                        jpg_bytes = render_card(html)
-                        st.image(jpg_bytes, width=720)
-                        slug = selected.lower().replace(' ', '_').replace('.', '')
-                        st.download_button(
-                            label='⬇️ Download card JPG',
-                            data=jpg_bytes,
-                            file_name=f'{slug}_tunneling_card.jpg',
-                            mime='image/jpeg'
-                        )
-                except Exception as e:
-                    st.error(f'Card render failed: {e}')
-                    st.exception(e)
-
-# ─── Tab 3: Export ────────────────────────────────────────────────────────────
-with tab3:
-    st.markdown('### Download Leaderboard')
-    st.markdown(
-        f'Exports the full **{total_q}-pitcher** leaderboard '
-        f'({start_str} → {end_str}) in V17-compatible Excel format.'
-    )
-    if st.button('📥 Generate Excel'):
-        with st.spinner('Building Excel…'):
-            try:
-                tmp = '/tmp/tunneling_export.xlsx'
-                build_excel(lb_filtered, tmp, start_str, end_str)
-                with open(tmp, 'rb') as f:
-                    st.download_button(
-                        label='⬇️ Download Tunneling+.xlsx',
-                        data=f.read(),
-                        file_name=f'tunneling_plus_{season}_{end_str}.xlsx',
-                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                    )
-            except ImportError:
-                st.error('openpyxl not installed. Run: `pip install openpyxl`')
-
-# ─── Tab 4: Diagnostic ───────────────────────────────────────────────────────
-with tab4:
-    st.markdown('### Statcast Aggregated Data')
-    st.markdown(
-        'Per pitcher per pitch type after all calibration fixes. '
-        'All pitches — no windup filter. '
-        'hb sign is hand-dependent (LHP fix applied). '
-        'All pitches — no windup or runner filter. hb sign is hand-dependent.'
-    )
-
-    search_diag = st.text_input('Filter pitcher', '', key='diag_search')
-
-    diag_cols = ['pitcher_id', 'pitcher_name', 'hand', 'pitcher_team', 'pitch_type',
-                 'pitches', 'velo', 'ivb', 'hb', 'extension', 'release_height',
-                 'release_side', 'tunnel_x', 'tunnel_z', 'plate_x', 'plate_z']
-    diag_df = pools[[c for c in diag_cols if c in pools.columns]].copy()
-
-    if search_diag:
-        try:
-            diag_df = diag_df[diag_df['pitcher_name'].str.contains(
-                search_diag, case=False, na=False)]
-        except Exception:
-            pass
-
-    st.dataframe(diag_df.round(4), width="stretch", hide_index=True)
-
-    csv_bytes = diag_df.round(4).to_csv(index=False).encode()
-    st.download_button(
-        label='⬇️ Download aggregated Statcast CSV',
-        data=csv_bytes,
-        file_name=f'statcast_aggregated_{start_str}_{end_str}.csv',
-        mime='text/csv'
-    )
-    st.caption(
-        'release_side = release_pos_x + (0.3655×ext − 2.4608). '
-        'hb: RHP = pfx_x×12, LHP = pfx_x×12×−1. All pitches, no windup filter.'
-    )
-
-# ─── Tab 5: Methodology ───────────────────────────────────────────────────────
-with tab5:
-    st.markdown("## Tunneling+ — Model Methodology")
-    st.caption(f"v18 · Statcast Edition · {start_str} to {end_str}")
-
-    st.markdown("---")
-    st.markdown("### What is Tunneling+?")
-    st.markdown(
-        "Tunneling+ measures how well a pitcher disguises his pitches through the "
-        "**tunnel point** — the moment roughly 23.8 ft from the plate where a hitter "
-        "must commit to swing or take. Pitches that look identical at the tunnel point "
-        "but diverge dramatically by the plate are the hardest to read. "
-        "Normalized within handedness: 100 = league average, 1 SD approx 15 points, "
-        "winsorized to [60, 160]."
-    )
-
-    st.markdown("---")
-    st.markdown("### Pair Classification")
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.markdown("**Tunnel pair**")
-        st.markdown(
-            "Tunnel distance < 6.6 inches (league p50) "
-            "AND plate divergence ratio > 1.5x. "
-            "Pitches that converge at the commit point then break sharply apart."
-        )
-    with col_b:
-        st.markdown("**Speed-change pair**")
-        st.markdown(
-            "Plate distance < 14.9 inches (league p33) "
-            "AND velocity gap > 6.8 mph (league p50). "
-            "Same location, different speed — hitter commits before detecting the difference."
-        )
-    with col_c:
-        st.markdown("**Irrelevant pair**")
-        st.markdown(
-            "Neither condition met. Excluded for pitchers with at least one qualifying pair. "
-            "Pitchers with only irrelevant pairs are scored on raw metrics and "
-            "flagged 'Unclassified pairs.'"
-        )
-
-    st.markdown("---")
-    st.markdown("### Tunnel Composite Score")
-    st.markdown(
-        "Qualifying tunnel pairs are weighted by **usage x tunnel ratio** — "
-        "higher weight to elite, frequently-thrown pairs. "
-        "The composite is a weighted average of five components:"
-    )
-    components = [
-        ("35%", "Tunnel Ratio (TR)",
-         "Plate spread divided by tunnel distance. Primary signal — how much the pitch "
-         "breaks after the commit point relative to how tight it looks at the tunnel point."),
-        ("20%", "Break:Tunnel Ratio (BTR)",
-         "Additional plate spread beyond the tunnel distance. "
-         "Rewards pitches that break more than they tunnel."),
-        ("15%", "Interaction Index (IX)",
-         "Axis alignment combined with plate divergence. Rewards pitches that tunnel "
-         "on-axis but diverge sharply at the plate."),
-        ("15%", "Release:Tunnel Ratio (RTR) — inverted",
-         "Release spread relative to tunnel distance. Lower is better — a consistent "
-         "release slot hiding different pitches scores higher."),
-        ("10%", "Late Break Multiplier (LBM)",
-         "Rewards pitches with break concentrated after the tunnel point "
-         "rather than early in flight."),
-        ("5%",  "Velocity Differential (VD)",
-         "Absolute velocity gap between paired pitches. Modest contribution — "
-         "speed difference adds deception on top of movement."),
-    ]
-    for pct, name, desc in components:
-        st.markdown(f"**{pct} — {name}:** {desc}")
-        st.markdown("")
-
-    st.markdown("---")
-    st.markdown("### Final Composite and Normalization")
-    st.markdown(
-        "Final score = **80% tunnel composite + 20% temporal** (speed-change deception). "
-        "Both components are z-scored within handedness before combining, so RHP and LHP "
-        "are evaluated against their own peers. Converted to a 100-point scale "
-        "(mean=100, std approx 15), winsorized to [60, 160]. "
-        "Minimum 10 pitches per pitch type and 50 total pitches to qualify."
-    )
-
-    st.markdown("---")
-    st.markdown("### Data and Calibration")
-    cc1, cc2 = st.columns(2)
-    with cc1:
-        st.markdown("**Source**")
-        st.markdown(
-            "Baseball Savant (Statcast) via pybaseball. "
-            "All pitches included — no runner or windup filter. "
-            "Data cached for 1 hour per date range."
-        )
-        st.markdown("**hb sign convention**")
-        st.markdown(
-            "Positive hb = arm side for that pitcher. "
-            "RHP: pfx_x x 12 x -1. "
-            "LHP: pfx_x x 12 (no flip). "
-            "Converts Statcast catcher-relative coordinates to pitcher-relative arm-side convention."
-        )
-    with cc2:
-        st.markdown("**release_side correction**")
-        st.markdown(
-            "release_side = release_pos_x + (0.3655 x extension - 2.4608). "
-            "Extension-based correction fitted from diagnostic analysis of "
-            "Statcast release_pos_x. "
-            "Reduces mean offset to under 0.03 ft per pitch type."
-        )
-        st.markdown("**Known limitation**")
-        st.markdown(
-            "Statcast release_pos_x has less within-pitcher spread across pitch types "
-            "than some reference implementations (avg 0.24 ft vs 0.33 ft). "
-            "This produces a Statcast-native calibration."
-        )
-
-    st.markdown("---")
-    st.markdown("### Model Constants")
-    const_data = {
-        "Tunnel point": "23.8 ft from plate",
-        "Tunnel threshold": "6.6 in (league p50 tunnel distance)",
-        "Min tunnel ratio": "1.5x",
-        "Speed-change plate threshold": "14.9 in (league p33)",
-        "Speed-change velo threshold": "6.8 mph (league p50)",
-        "League avg plate distance": "20.07 in",
-        "Min pitches per pitch type": "10",
-        "Min total pitches to qualify": "50",
-        "Score range": "60 to 160 (winsorized)",
-        "Normalization": "Within handedness, mean=100, std approx 15",
-    }
-    for k, v in const_data.items():
-        st.markdown(f"- **{k}:** {v}")
-
-    st.markdown("---")
-    st.caption("Tunneling+ v18 · By Robert Colonna · Built on Statcast via pybaseball")
 
 
 # ─── Tab 6: Tunnel Comps ──────────────────────────────────────────────────────
@@ -1442,10 +985,7 @@ with tab6:
 # ─── Tab 7: Metric Correlations ───────────────────────────────────────────────
 with tab7:
     st.markdown("### Metric Correlations")
-    st.caption(
-        "How do tunneling metrics relate to real-world outcomes? "
-        "Outcome data pulled automatically from Baseball Savant."
-    )
+    st.caption("How do tunneling metrics relate to real-world outcomes? Outcome data pulled automatically from Baseball Savant.")
 
     with st.spinner("Loading outcome data from Baseball Savant..."):
         outcomes = load_outcome_data(season)
@@ -1458,7 +998,7 @@ with tab7:
             with st.expander("Full traceback"):
                 st.code(tb_msg)
     else:
-        # ── Join tunneling metrics with outcomes on pitcher_id ─────────────────
+        # ── Join on pitcher_id ─────────────────────────────────────────────────
         lb_corr = lb_filtered[
             ['pitcher_id', 'name', 'hand', 'team', 'pitches',
              'tunneling_plus', 'tp_pct',
@@ -1468,27 +1008,28 @@ with tab7:
              'temporal', 'n_tunnel_pairs']
         ].copy()
         lb_corr['pitcher_id'] = pd.to_numeric(lb_corr['pitcher_id'], errors='coerce')
-
         merged = lb_corr.merge(outcomes, on='pitcher_id', how='inner')
 
         if len(merged) < 5:
-            st.warning(
-                f"Only {len(merged)} pitchers matched on pitcher_id. "
-                f"lb has {len(lb_corr)}, outcomes has {len(outcomes)}. "
-                "Check that pitcher_id column types match."
-            )
+            st.warning(f"Only {len(merged)} pitchers matched. lb has {len(lb_corr)}, outcomes has {len(outcomes)}.")
         else:
             st.success(f"Matched {len(merged)} pitchers.")
 
+            # ── Column definitions ─────────────────────────────────────────────
             OUTCOME_LABELS = {
-                'k_pct':       'K%',
-                'bb_pct':      'BB%',
-                'whiff_pct':   'Whiff%',
-                'barrel_pct':  'Barrel%',
-                'hard_hit_pct':'Hard Hit%',
-                'xwoba':       'xwOBA',
-                'xera':        'xERA',
-                'xba':         'xBA',
+                'whiff_pct':    'Whiff%',
+                'k_pct':        'K%',
+                'bb_pct':       'BB%',
+                'chase_pct':    'Chase%',
+                'o_swing_pct':  'O-Swing%',
+                'gb_pct':       'GB%',
+                'barrel_pct':   'Barrel%',
+                'hard_hit_pct': 'Hard Hit%',
+                'csw_pct':      'CSW%',
+                'z_contact_pct':'Z-Contact%',
+                'xwoba':        'xwOBA',
+                'xera':         'xERA',
+                'xba':          'xBA',
             }
             TUNNEL_COLS = {
                 'tunneling_plus':   'T+',
@@ -1503,162 +1044,188 @@ with tab7:
             avail_tunnel   = {k: v for k, v in TUNNEL_COLS.items()
                               if k in merged.columns}
 
-            # ══════════════════════════════════════════════════════════════════
-            # SECTION 1: Correlation matrix
-            # ══════════════════════════════════════════════════════════════════
+            # ── Shared axis selectors (drive both scatter and league table) ────
             st.markdown("---")
-            st.markdown("#### League-Wide Correlations")
-            st.caption(f"Pearson r across {len(merged)} pitchers · 2026")
-            st.markdown(
-                "Each cell shows how strongly a tunneling metric (rows) correlates with a real-world "
-                "outcome (columns). A value near **+1.0** means the two move together — pitchers who "
-                "score higher on that metric also tend to have better outcomes. Near **-1.0** means "
-                "they move opposite. Near **0** means little relationship. "
-                "For xERA and xwOBA, a *negative* correlation with T+ is the good sign — "
-                "it means pitchers who tunnel well tend to allow weaker contact."
-            )
-
-            corr_data = []
-            for tcol, tlabel in avail_tunnel.items():
-                row = {'Metric': tlabel}
-                for ocol, olabel in avail_outcomes.items():
-                    pair = merged[[tcol, ocol]].dropna()
-                    if len(pair) >= 8:
-                        row[olabel] = round(float(pair[tcol].corr(pair[ocol])), 3)
-                    else:
-                        row[olabel] = None
-                corr_data.append(row)
-
-            corr_df = pd.DataFrame(corr_data).set_index('Metric')
-
-            def _color_r(val):
-                if pd.isna(val): return 'color: #999'
-                if val >  0.3:  return 'background-color: #d4edda; color: #155724'
-                if val >  0.15: return 'background-color: #e8f5e9; color: #155724'
-                if val < -0.3:  return 'background-color: #f8d7da; color: #721c24'
-                if val < -0.15: return 'background-color: #fdecea; color: #721c24'
-                return ''
-
-            styled = corr_df.style.map(_color_r).format('{:.3f}', na_rep='—')
-            st.dataframe(styled, width='stretch')
-
-
-            # ══════════════════════════════════════════════════════════════════
-            # SECTION 2: Scatter explorer
-            # ══════════════════════════════════════════════════════════════════
-            st.markdown("---")
-            st.markdown("#### Scatter Explorer")
-            st.markdown(
-                "Pick any tunneling metric and outcome to see how they relate across all qualified "
-                "pitchers this season. Each dot is one pitcher — hover to see who it is. "
-                "The dashed line is the best-fit trend. A steep upward slope means the metric "
-                "is a strong predictor of that outcome."
-            )
-
-            sc1, sc2 = st.columns(2)
-            with sc1:
-                x_label = st.selectbox('X axis (tunneling metric)', list(avail_tunnel.values()), key='corr_x')
-            with sc2:
-                y_label = st.selectbox('Y axis (outcome)', list(avail_outcomes.values()), key='corr_y')
+            _ax1, _ax2, _ax3 = st.columns([2, 2, 2])
+            with _ax1:
+                x_label = st.selectbox('Tunneling metric (X)', list(avail_tunnel.values()), key='corr_x')
+            with _ax2:
+                y_label = st.selectbox('Outcome (Y)', list(avail_outcomes.values()), key='corr_y')
+            with _ax3:
+                all_names_corr = sorted(merged['name'].dropna().unique().tolist())
+                _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
+                _idx = all_names_corr.index(_def) if _def in all_names_corr else 0
+                hl_pitcher = st.selectbox('Highlight pitcher', ['(none)'] + all_names_corr, index=_idx + 1, key='corr_hl')
 
             x_col = [k for k, v in avail_tunnel.items()   if v == x_label][0]
             y_col = [k for k, v in avail_outcomes.items() if v == y_label][0]
             scatter_df = merged[['name', 'team', 'hand', x_col, y_col]].dropna()
 
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 1: Scatter Explorer
+            # ══════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("#### Scatter Explorer")
+            st.markdown(
+                "Each dot is one pitcher. The dashed line is the best-fit trend — "
+                "a steep slope means that tunneling metric is a strong predictor of that outcome. "
+                "Hover to see any pitcher. Use **Highlight pitcher** above to call one out specifically."
+            )
+
             if len(scatter_df) >= 5:
                 import json as _json
-                _x = scatter_df[x_col].values.astype(float)
-                _y = scatter_df[y_col].values.astype(float)
-                _r = float(pd.Series(_x).corr(pd.Series(_y)))
-                chart_data = [{'name': r['name'], 'team': r['team'], 'hand': r['hand'],
-                               'x': float(r[x_col]), 'y': float(r[y_col])}
-                              for _, r in scatter_df.iterrows()]
+                _x  = scatter_df[x_col].values.astype(float)
+                _y  = scatter_df[y_col].values.astype(float)
+                _r  = float(pd.Series(_x).corr(pd.Series(_y)))
+                _c  = np.polyfit(_x, _y, 1)
                 xmin, xmax = float(_x.min()), float(_x.max())
                 ymin, ymax = float(_y.min()), float(_y.max())
-                xpad, ypad = (xmax-xmin)*0.08 or 1, (ymax-ymin)*0.08 or 1
-                _c   = np.polyfit(_x, _y, 1)
-                tlx  = [xmin-xpad, xmax+xpad]
-                tly  = [float(_c[0]*v+_c[1]) for v in tlx]
+                xpad = (xmax - xmin) * 0.1 or 1
+                ypad = (ymax - ymin) * 0.1 or 1
+                tlx = [xmin - xpad, xmax + xpad]
+                tly = [float(_c[0]*v + _c[1]) for v in tlx]
+
+                # Mark the highlighted pitcher
+                hl_row = None
+                if hl_pitcher != '(none)':
+                    _hl = scatter_df[scatter_df['name'] == hl_pitcher]
+                    if not _hl.empty:
+                        hl_row = {'name': hl_pitcher,
+                                  'x': float(_hl[x_col].iloc[0]),
+                                  'y': float(_hl[y_col].iloc[0]),
+                                  'team': str(_hl['team'].iloc[0]),
+                                  'hand': str(_hl['hand'].iloc[0])}
+
+                chart_data = [{'name': row['name'], 'team': row['team'], 'hand': row['hand'],
+                               'x': float(row[x_col]), 'y': float(row[y_col]),
+                               'hl': row['name'] == hl_pitcher}
+                              for _, row in scatter_df.iterrows()]
 
                 scatter_html = f"""
 <div style="font-family:sans-serif">
-<div style="margin-bottom:6px;color:#555;font-size:13px">r = <strong>{_r:+.3f}</strong> &nbsp;·&nbsp; n = {len(scatter_df)}</div>
-<div style="position:relative;width:100%;height:440px;background:#fafafa;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
-<canvas id="sc2" width="800" height="440" style="width:100%;height:100%"></canvas>
-<div id="tt2" style="position:absolute;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:6px 10px;font-size:12px;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.15)"></div>
+<div style="margin-bottom:6px;color:#555;font-size:13px">r = <strong>{_r:+.3f}</strong> &nbsp;·&nbsp; n = {len(scatter_df)}{f' &nbsp;·&nbsp; <span style="color:#e07b00;font-weight:600">▶ {hl_pitcher}</span>' if hl_pitcher != '(none)' else ''}</div>
+<div style="position:relative;width:100%;height:460px;background:#fafafa;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden">
+<canvas id="scMain" width="820" height="460" style="width:100%;height:100%"></canvas>
+<div id="ttMain" style="position:absolute;display:none;background:#fff;border:1px solid #ccc;border-radius:6px;padding:6px 10px;font-size:12px;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.15)"></div>
 </div></div>
 <script>
 (function(){{
   const pts={_json.dumps(chart_data)},tlX={_json.dumps(tlx)},tlY={_json.dumps(tly)};
-  const xL={_json.dumps(x_label)},yL={_json.dumps(y_label)};
+  const xL={_json.dumps(x_label)},yL={_json.dumps(y_label)},hlName={_json.dumps(hl_pitcher)};
   const xMn={xmin-xpad},xMx={xmax+xpad},yMn={ymin-ypad},yMx={ymax+ypad};
-  const cv=document.getElementById('sc2'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height;
-  const P={{l:60,r:20,t:20,b:50}};
+  const cv=document.getElementById('scMain'),ctx=cv.getContext('2d'),W=cv.width,H=cv.height;
+  const P={{l:64,r:24,t:24,b:54}};
   function tx(v){{return P.l+(v-xMn)/(xMx-xMn)*(W-P.l-P.r);}}
   function ty(v){{return H-P.b-(v-yMn)/(yMx-yMn)*(H-P.t-P.b);}}
-  ctx.strokeStyle='#e8e8e8';ctx.lineWidth=1;
+  // grid
+  ctx.strokeStyle='#ececec';ctx.lineWidth=1;
   for(let i=0;i<=5;i++){{
     const y=P.t+i*(H-P.t-P.b)/5;ctx.beginPath();ctx.moveTo(P.l,y);ctx.lineTo(W-P.r,y);ctx.stroke();
     const x=P.l+i*(W-P.l-P.r)/5;ctx.beginPath();ctx.moveTo(x,P.t);ctx.lineTo(x,H-P.b);ctx.stroke();
   }}
-  ctx.strokeStyle='#aaa';ctx.lineWidth=1.5;
+  // axes
+  ctx.strokeStyle='#bbb';ctx.lineWidth=1.5;
   ctx.beginPath();ctx.moveTo(P.l,P.t);ctx.lineTo(P.l,H-P.b);ctx.lineTo(W-P.r,H-P.b);ctx.stroke();
-  ctx.fillStyle='#666';ctx.font='12px sans-serif';ctx.textAlign='center';
-  ctx.fillText(xL,W/2,H-8);
-  ctx.save();ctx.translate(14,H/2);ctx.rotate(-Math.PI/2);ctx.fillText(yL,0,0);ctx.restore();
-  ctx.font='10px sans-serif';ctx.fillStyle='#999';
+  // axis labels
+  ctx.fillStyle='#555';ctx.font='13px sans-serif';ctx.textAlign='center';
+  ctx.fillText(xL,W/2,H-6);
+  ctx.save();ctx.translate(13,H/2);ctx.rotate(-Math.PI/2);ctx.fillText(yL,0,0);ctx.restore();
+  // ticks
+  ctx.font='10px sans-serif';ctx.fillStyle='#aaa';
   for(let i=0;i<=5;i++){{
     const xv=xMn+i*(xMx-xMn)/5;ctx.textAlign='center';ctx.fillText(xv.toFixed(2),tx(xv),H-P.b+14);
-    const yv=yMn+i*(yMx-yMn)/5;ctx.textAlign='right';ctx.fillText(yv.toFixed(2),P.l-4,ty(yv)+4);
+    const yv=yMn+i*(yMx-yMn)/5;ctx.textAlign='right';ctx.fillText(yv.toFixed(2),P.l-5,ty(yv)+4);
   }}
-  ctx.strokeStyle='rgba(200,80,80,.6)';ctx.lineWidth=1.5;ctx.setLineDash([5,4]);
+  // trendline
+  ctx.strokeStyle='rgba(200,80,80,.5)';ctx.lineWidth=1.5;ctx.setLineDash([6,4]);
   ctx.beginPath();ctx.moveTo(tx(tlX[0]),ty(tlY[0]));ctx.lineTo(tx(tlX[1]),ty(tlY[1]));ctx.stroke();
   ctx.setLineDash([]);
-  pts.forEach(p=>{{
-    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),5,0,Math.PI*2);
-    ctx.fillStyle=p.hand==='L'?'rgba(59,130,246,.75)':'rgba(16,185,129,.75)';
-    ctx.strokeStyle=p.hand==='L'?'#1d4ed8':'#059669';ctx.lineWidth=1;
+  // draw non-highlighted first, then highlighted on top
+  pts.filter(p=>!p.hl).forEach(p=>{{
+    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),4.5,0,Math.PI*2);
+    ctx.fillStyle=p.hand==='L'?'rgba(59,130,246,.55)':'rgba(16,185,129,.55)';
+    ctx.strokeStyle=p.hand==='L'?'#3b82f6':'#10b981';ctx.lineWidth=.8;
     ctx.fill();ctx.stroke();
   }});
-  const tip=document.getElementById('tt2');
+  pts.filter(p=>p.hl).forEach(p=>{{
+    // halo
+    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),11,0,Math.PI*2);
+    ctx.fillStyle='rgba(230,120,0,.18)';ctx.fill();
+    // dot
+    ctx.beginPath();ctx.arc(tx(p.x),ty(p.y),7,0,Math.PI*2);
+    ctx.fillStyle='#e07b00';ctx.strokeStyle='#a05000';ctx.lineWidth=1.5;
+    ctx.fill();ctx.stroke();
+    // label
+    ctx.fillStyle='#a05000';ctx.font='bold 11px sans-serif';ctx.textAlign='left';
+    const lx=tx(p.x)+10, ly=ty(p.y)-6;
+    ctx.fillText(p.name,lx,ly);
+  }});
+  // tooltip
+  const tip=document.getElementById('ttMain');
   cv.addEventListener('mousemove',function(e){{
     const rc=cv.getBoundingClientRect(),sx=cv.width/rc.width,sy=cv.height/rc.height;
     const mx=(e.clientX-rc.left)*sx,my=(e.clientY-rc.top)*sy;
-    let hit=null;
-    pts.forEach(p=>{{const dx=tx(p.x)-mx,dy=ty(p.y)-my;if(Math.sqrt(dx*dx+dy*dy)<9)hit=p;}});
+    let hit=null,bestD=12;
+    pts.forEach(p=>{{const dx=tx(p.x)-mx,dy=ty(p.y)-my,d=Math.sqrt(dx*dx+dy*dy);if(d<bestD){{bestD=d;hit=p;}}}});
     if(hit){{
       tip.style.display='block';
-      tip.style.left=(e.clientX-rc.left+12)+'px';tip.style.top=(e.clientY-rc.top-20)+'px';
-      tip.innerHTML=`<strong>${{hit.name}}</strong> (${{hit.team}})<br>${{xL}}: ${{hit.x.toFixed(3)}}<br>${{yL}}: ${{hit.y.toFixed(3)}}`;
+      tip.style.left=(e.clientX-rc.left+14)+'px';tip.style.top=(e.clientY-rc.top-24)+'px';
+      tip.innerHTML=`<strong>${{hit.name}}</strong> (${{hit.team}} · ${{hit.hand}}HP)<br>${{xL}}: ${{hit.x.toFixed(3)}}<br>${{yL}}: ${{hit.y.toFixed(3)}}`;
     }}else tip.style.display='none';
   }});
   cv.addEventListener('mouseleave',()=>tip.style.display='none');
 }})();
 </script>"""
-                st.components.v1.html(scatter_html, height=480)
-                st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; Hover for name")
+                st.components.v1.html(scatter_html, height=500)
+                st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; 🟠 Highlighted pitcher &nbsp;·&nbsp; Hover for details")
 
             # ══════════════════════════════════════════════════════════════════
-            # SECTION 3: Individual breakdown
+            # SECTION 2: League correlation table (same outcome as scatter)
+            # ══════════════════════════════════════════════════════════════════
+            st.markdown("---")
+            st.markdown("#### League-Wide Correlations")
+            st.markdown(
+                f"How strongly each tunneling metric correlates with **{y_label}** across all {len(merged)} pitchers. "
+                "Pearson r ranges from -1 to +1. Values near 0 mean little relationship. "
+                f"{'A *negative* r is the good direction here — lower '+y_label+' is better for the pitcher.' if y_col in ('xwoba','xera','barrel_pct','bb_pct') else 'A *positive* r means the metric predicts better outcomes.'}"
+            )
+
+            # Build one row per tunneling metric for the selected outcome only
+            corr_rows = []
+            for tcol, tlabel in avail_tunnel.items():
+                pair = merged[[tcol, y_col]].dropna()
+                if len(pair) >= 8:
+                    r = round(float(pair[tcol].corr(pair[y_col])), 3)
+                    # Also compute r for all outcomes for completeness
+                    corr_rows.append({'Tunneling Metric': tlabel, f'r vs {y_label}': r, 'n': len(pair)})
+
+            if corr_rows:
+                corr_tbl = pd.DataFrame(corr_rows).sort_values(f'r vs {y_label}', key=abs, ascending=False)
+                st.dataframe(corr_tbl, hide_index=True, width='stretch',
+                    column_config={{
+                        f'r vs {y_label}': st.column_config.NumberColumn(format='%.3f'),
+                        'n': st.column_config.NumberColumn('Sample', width='small'),
+                    }})
+
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 3: Individual pitcher breakdown (same axes)
             # ══════════════════════════════════════════════════════════════════
             st.markdown("---")
             st.markdown("#### Individual Pitcher Breakdown")
             st.markdown(
-                "For each pitcher, this shows what their tunneling metrics *predict* their outcomes "
-                "should be based on league-wide regression, and how their actual results compare. "
-                "**Exp Range** is ±1 standard deviation around the prediction — roughly where 68% "
-                "of pitchers with a similar metric profile land. ✅ means outperforming the model, "
-                "⚠️ means underperforming. Only metric/outcome pairs with |r| ≥ 0.10 are shown."
+                f"What does **{hl_pitcher if hl_pitcher != '(none)' else 'the selected pitcher'}**'s tunneling profile predict for their outcomes, "
+                "and how do their actual results compare? "
+                "**Predicted** is from linear regression of each metric vs that outcome league-wide. "
+                "**Exp Range** is ±1 SD — where ~68% of similar pitchers land. "
+                "✅ outperforming · ⚠️ underperforming · ➖ within expected range."
             )
 
-            all_names_corr = sorted(merged['name'].dropna().unique().tolist())
-            _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
-            _idx = all_names_corr.index(_def) if _def in all_names_corr else 0
-            sel  = st.selectbox('Select pitcher', all_names_corr, index=_idx, key='corr_sel')
+            sel = hl_pitcher if hl_pitcher != '(none)' else (all_names_corr[0] if all_names_corr else None)
 
-            if sel:
+            if sel and sel in merged['name'].values:
                 pr = merged[merged['name'] == sel].iloc[0]
                 st.markdown(f"**{sel}** &nbsp;·&nbsp; {pr.get('team','')} &nbsp;·&nbsp; {pr.get('hand','')}HP")
+
                 rows_bd = []
                 for tcol, tlabel in avail_tunnel.items():
                     for ocol, olabel in avail_outcomes.items():
@@ -1668,14 +1235,14 @@ with tab7:
                         if abs(r) < 0.10: continue
                         _xv = pair[tcol].values.astype(float)
                         _yv = pair[ocol].values.astype(float)
-                        _coeffs = np.polyfit(_xv, _yv, 1)
-                        _m, _b = float(_coeffs[0]), float(_coeffs[1])
+                        _co = np.polyfit(_xv, _yv, 1)
+                        _m, _b = float(_co[0]), float(_co[1])
                         pred   = _m * float(pr[tcol]) + _b
                         sd     = float(np.std(_yv - (_m * _xv + _b)))
                         actual = pr.get(ocol, None)
                         if pd.isna(actual): continue
                         actual = float(actual)
-                        _low = ocol in ('xwoba', 'xera', 'barrel_pct', 'bb_pct')
+                        _low = ocol in ('xwoba','xera','barrel_pct','bb_pct','hard_hit_pct')
                         if _low:
                             verdict = '✅ Better' if actual < pred-sd else ('⚠️ Worse' if actual > pred+sd else '➖ In range')
                         else:
@@ -1686,13 +1253,16 @@ with tab7:
                             'Exp Range': f'{pred-sd:.2f} – {pred+sd:.2f}',
                             'Actual': round(actual,3), 'vs Expected': verdict,
                         })
+
                 if rows_bd:
                     bd_df = pd.DataFrame(rows_bd).sort_values(['Outcome','Tunnel Metric'])
                     st.dataframe(bd_df, hide_index=True, width='stretch',
-                        column_config={
+                        column_config={{
                             'r':         st.column_config.NumberColumn('Pearson r', format='%.3f', width='small'),
                             'Predicted': st.column_config.NumberColumn(format='%.3f', width='small'),
                             'Actual':    st.column_config.NumberColumn(format='%.3f', width='small'),
-                        })
+                        }})
                 else:
                     st.info("No correlations strong enough (|r| ≥ 0.10) for this pitcher.")
+            else:
+                st.info("Select a pitcher in the Highlight pitcher dropdown above to see their breakdown.")
