@@ -814,6 +814,471 @@ def load_outcome_data(season: int):
         return pd.DataFrame({'_error': [str(_e)], '_tb': [traceback.format_exc()]})
 
 
+
+
+# Use sys.modules to store results — truly process-global, survives reruns.
+import threading, time as _time, sys as _sys
+
+_STORE_KEY = '__tplus_data_store__'
+if _STORE_KEY not in _sys.modules:
+    _sys.modules[_STORE_KEY] = {}
+_tplus_store = _sys.modules[_STORE_KEY]
+
+_cache_key  = f'data_{start_str}_{end_str}'
+_err_key    = f'err_{start_str}_{end_str}'
+_thread_key = f'thread_{start_str}_{end_str}'
+_t0_key     = f't0_{start_str}_{end_str}'
+
+# Evict any OTHER season's data immediately so we never hold two seasons in RAM
+for _stale_key in [k for k in list(_tplus_store.keys())
+                   if k.startswith('data_') and k != _cache_key]:
+    del _tplus_store[_stale_key]
+for _stale_k in [k for k in list(_tplus_store.keys())
+                 if (k.startswith('thread_') or k.startswith('err_') or k.startswith('t0_'))
+                 and not k.endswith(f'_{start_str}_{end_str}')]:
+    _tplus_store.pop(_stale_k, None)
+
+# Start background thread if result not yet available and no thread running
+if _cache_key not in _tplus_store:
+    _existing_thread = _tplus_store.get(_thread_key)
+    _thread_running  = _existing_thread is not None and _existing_thread.is_alive()
+    if not _thread_running and _err_key not in _tplus_store:
+        def _load_in_background():
+            try:
+                _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
+            except Exception as exc:
+                _tplus_store[_err_key] = exc
+
+        _t = threading.Thread(target=_load_in_background, daemon=True)
+        _tplus_store[_thread_key] = _t
+        _tplus_store[_t0_key]     = _time.time()
+        _t.start()
+
+# Poll: show status and rerun
+if _cache_key not in _tplus_store:
+    _thread_done = (
+        _tplus_store.get(_thread_key) is not None
+        and not _tplus_store[_thread_key].is_alive()
+    )
+    _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
+    if _err_key in _tplus_store:
+        _err = _tplus_store[_err_key]
+        st.error(f'Failed to load data: {_err}')
+        st.exception(_err)
+        if st.button('🔄 Retry'):
+            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
+                _tplus_store.pop(_k, None)
+            st.rerun()
+        st.stop()
+    if _elapsed > 480:
+        st.error(f'Data load timed out after {_elapsed}s. Try clicking Retry.')
+        if st.button('🔄 Retry'):
+            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
+                _tplus_store.pop(_k, None)
+            st.rerun()
+        st.stop()
+    if _thread_done:
+        st.error(
+            'Data load thread finished without a result. '
+            f'Store keys: {list(_tplus_store.keys())}.'
+        )
+        if st.button('🔄 Retry'):
+            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
+                _tplus_store.pop(_k, None)
+            st.rerun()
+        st.stop()
+    st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
+    _time.sleep(2)
+    st.rerun()
+
+if _err_key in _tplus_store:
+    st.error(f'Failed to load data: {_tplus_store[_err_key]}')
+    st.exception(_tplus_store[_err_key])
+    st.stop()
+
+lb, pools = _tplus_store[_cache_key]
+
+# Filter and rerank
+lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
+lb_filtered['rank'] = lb_filtered['tunneling_plus'].rank(
+    ascending=False, method='min').astype(int)
+lb_filtered['tp_pct'] = lb_filtered['tunneling_plus'].rank(
+    pct=True).mul(100).round(0).astype(int)
+
+# Percentile columns for leaderboard
+lb_filtered['tr_pct'] = lb_filtered['avg_tunnel_ratio'].rank(
+    pct=True).mul(100).round(0).astype(int)
+lb_filtered['spd_pct'] = lb_filtered['n_speed_pairs'].rank(
+    pct=True).mul(100).round(0).astype(int)
+
+def _compute_rc(pools_df, pitcher_ids):
+    from itertools import combinations as _comb
+    rc_map = {}
+    for pid, grp in pools_df.groupby('pitcher_id'):
+        if pid not in pitcher_ids:
+            continue
+        grp = grp[grp['pitches'] >= 10].copy()
+        if len(grp) < 2:
+            continue
+        total = grp['pitches'].sum()
+        grp['pitch_frac'] = grp['pitches'] / total
+        rc_w = []
+        for (_, r1), (_, r2) in _comb(grp.iterrows(), 2):
+            if 'rel_x' not in r1 or 'rel_x' not in r2:
+                continue
+            rd = float(np.sqrt((r1['rel_x']-r2['rel_x'])**2+(r1['rel_z']-r2['rel_z'])**2))
+            uw = float(r1['pitch_frac'] * r2['pitch_frac'])
+            rc_w.append((rd, uw))
+        if rc_w:
+            tw = sum(x[1] for x in rc_w)
+            rc_map[pid] = sum(x[0]*x[1] for x in rc_w) / tw
+    return rc_map
+
+_rc_map = _compute_rc(pools, set(lb_filtered['pitcher_id'].tolist()))
+lb_filtered['rc_val'] = lb_filtered['pitcher_id'].map(_rc_map)
+lb_filtered['rc_pct'] = (
+    lb_filtered['rc_val'].rank(pct=True, ascending=False)
+    .mul(100).round(0).fillna(50).astype(int)
+)
+
+for hand in ['R', 'L']:
+    mask = lb_filtered['hand'] == hand
+    lb_filtered.loc[mask, 'total_hand'] = int(mask.sum())
+
+total_q = len(lb_filtered)
+st.success(
+    f'✓ {total_q} pitchers · {start_str} → {end_str} · '
+    f'Loaded {datetime.now(timezone(timedelta(hours=-5))).strftime("%b %d, %I:%M %p")} EST'
+)
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ['📊 Leaderboard', '🃏 Player Card', '📥 Export', '🔬 Diagnostic', '📖 Methodology', '🔍 Tunnel Comps', '📈 Correlations']
+)
+
+# ─── Tab 1: Leaderboard ───────────────────────────────────────────────────────
+with tab1:
+    st.caption(f'Season {season} · {start_str} → {end_str} · Model v18 (Statcast)')
+
+    fc1, fc2, fc3 = st.columns([3, 1, 1])
+    with fc1:
+        all_names   = sorted(lb_filtered['name'].dropna().unique().tolist())
+        name_filter = st.multiselect('Search pitchers', all_names, placeholder='Type to search…')
+    with fc2:
+        teams    = ['All'] + sorted(lb_filtered['team'].dropna().unique().tolist())
+        team_sel = st.selectbox('Team', teams)
+    with fc3:
+        hand_sel = st.selectbox('Hand', ['All', 'R', 'L'])
+
+    display = lb_filtered.copy()
+    if name_filter:
+        display = display[display['name'].isin(name_filter)]
+    if team_sel != 'All':
+        display = display[display['team'] == team_sel]
+    if hand_sel != 'All':
+        display = display[display['hand'] == hand_sel]
+
+    show_cols = ['rank', 'tunneling_plus', 'tp_pct', 'name', 'team', 'hand',
+                 'pitches', 'n_types', 'n_tunnel_pairs', 'avg_tunnel_ratio',
+                 'n_speed_pairs', 'temporal']
+    col_names = {
+        'rank': 'Rank', 'tunneling_plus': 'T+', 'tp_pct': 'Pct',
+        'name': 'Pitcher', 'team': 'Team', 'hand': 'Hand',
+        'pitches': 'Pitches', 'n_types': 'Types',
+        'n_tunnel_pairs': 'Tun Pairs', 'avg_tunnel_ratio': 'Avg Ratio',
+        'n_speed_pairs': 'Spd Pairs', 'temporal': 'Temporal'
+    }
+    disp = display[show_cols].rename(columns=col_names)
+    st.dataframe(
+        disp,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            'Rank':      st.column_config.NumberColumn(width='small'),
+            'T+':        st.column_config.NumberColumn(format='%.1f', width='small'),
+            'Pct':       st.column_config.NumberColumn(format='%d', width='small'),
+            'Pitcher':   st.column_config.TextColumn(width='medium'),
+            'Team':      st.column_config.TextColumn(width='small'),
+            'Hand':      st.column_config.TextColumn(width='small'),
+            'Pitches':   st.column_config.NumberColumn(width='small'),
+            'Types':     st.column_config.NumberColumn(width='small'),
+            'Tun Pairs': st.column_config.NumberColumn(width='small'),
+            'Avg Ratio': st.column_config.NumberColumn(format='%.3f', width='medium'),
+            'Spd Pairs': st.column_config.NumberColumn(width='small'),
+            'Temporal':  st.column_config.NumberColumn(format='%.4f', width='medium'),
+        }
+    )
+    st.caption(f'Showing {len(disp)} of {total_q} qualified pitchers')
+
+    # Quick-nav to Player Card
+    if len(display) <= 20:
+        nav_names = display['name'].tolist()
+        if nav_names:
+            st.markdown('**→ Player Card:**')
+            nav_cols = st.columns(min(len(nav_names), 5))
+            for i, pname in enumerate(nav_names[:10]):
+                with nav_cols[i % 5]:
+                    if st.button(pname, key=f'nav_{pname}'):
+                        st.session_state['selected_pitcher'] = pname
+                        st.session_state['active_tab'] = 1
+
+# ─── Tab 2: Player Card ───────────────────────────────────────────────────────
+with tab2:
+    pitcher_names   = lb_filtered['name'].sort_values().tolist()
+    _default_pitcher = st.session_state.get('selected_pitcher', pitcher_names[0] if pitcher_names else None)
+    _default_idx    = pitcher_names.index(_default_pitcher) if _default_pitcher in pitcher_names else 0
+    selected = st.selectbox('Select pitcher', pitcher_names, index=_default_idx)
+    # Clear nav state after use
+    if 'selected_pitcher' in st.session_state:
+        del st.session_state['selected_pitcher']
+
+    playwright_ok = True
+    try:
+        from playwright.async_api import async_playwright  # noqa
+    except ImportError:
+        playwright_ok = False
+
+    if selected:
+        lb_row = lb_filtered[lb_filtered['name'] == selected].iloc[0]
+
+        if not playwright_ok:
+            st.warning(
+                'Playwright or Chromium not available — showing text card only. '
+                'Run `pip install playwright && playwright install chromium` for JPG cards.'
+            )
+            tp  = lb_row['tunneling_plus']
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric('T+', f'{tp:.1f}')
+            c2.metric('Percentile', f'{int(lb_row["tp_pct"])}th')
+            c3.metric('Tunnel Pairs', int(lb_row['n_tunnel_pairs']))
+            c4.metric('Avg Ratio', f'{lb_row["avg_tunnel_ratio"]:.3f}x')
+            details = lb_row.get('pitch_details', [])
+            if isinstance(details, str): details = json.loads(details)
+            if details:
+                adf = pd.DataFrame(sorted(details, key=lambda x: -x['frac']))
+                adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
+                                          'ivb':'IVB','hb':'HB','frac':'Usage%'})
+                cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
+                st.dataframe(adf[cols], width="stretch", hide_index=True)
+        else:
+            with st.spinner(f'Rendering card for {selected}…'):
+                try:
+                    league_pools = get_league_pools(start_str, end_str)
+                    info         = get_pitcher_card_info(selected, lb_row, pools, league_pools)
+                    if info is None:
+                        st.error(f'No pitch-level data found for {selected}.')
+                    else:
+                        html      = make_card_html(info)
+                        jpg_bytes = render_card(html)
+                        st.image(jpg_bytes, width=720)
+                        slug = selected.lower().replace(' ', '_').replace('.', '')
+                        st.download_button(
+                            label='⬇️ Download card JPG',
+                            data=jpg_bytes,
+                            file_name=f'{slug}_tunneling_card.jpg',
+                            mime='image/jpeg'
+                        )
+                except Exception as e:
+                    st.error(f'Card render failed: {e}')
+                    st.exception(e)
+
+# ─── Tab 3: Export ────────────────────────────────────────────────────────────
+with tab3:
+    st.markdown('### Download Leaderboard')
+    st.markdown(
+        f'Exports the full **{total_q}-pitcher** leaderboard '
+        f'({start_str} → {end_str}) in V17-compatible Excel format.'
+    )
+    if st.button('📥 Generate Excel'):
+        with st.spinner('Building Excel…'):
+            try:
+                tmp = '/tmp/tunneling_export.xlsx'
+                build_excel(lb_filtered, tmp, start_str, end_str)
+                with open(tmp, 'rb') as f:
+                    st.download_button(
+                        label='⬇️ Download Tunneling+.xlsx',
+                        data=f.read(),
+                        file_name=f'tunneling_plus_{season}_{end_str}.xlsx',
+                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    )
+            except ImportError:
+                st.error('openpyxl not installed. Run: `pip install openpyxl`')
+
+# ─── Tab 4: Diagnostic ───────────────────────────────────────────────────────
+with tab4:
+    st.markdown('### Statcast Aggregated Data')
+    st.markdown(
+        'Per pitcher per pitch type after all calibration fixes. '
+        'All pitches — no windup filter. '
+        'hb sign is hand-dependent (LHP fix applied). '
+        'All pitches — no windup or runner filter. hb sign is hand-dependent.'
+    )
+
+    search_diag = st.text_input('Filter pitcher', '', key='diag_search')
+
+    diag_cols = ['pitcher_id', 'pitcher_name', 'hand', 'pitcher_team', 'pitch_type',
+                 'pitches', 'velo', 'ivb', 'hb', 'extension', 'release_height',
+                 'release_side', 'tunnel_x', 'tunnel_z', 'plate_x', 'plate_z']
+    diag_df = pools[[c for c in diag_cols if c in pools.columns]].copy()
+
+    if search_diag:
+        try:
+            diag_df = diag_df[diag_df['pitcher_name'].str.contains(
+                search_diag, case=False, na=False)]
+        except Exception:
+            pass
+
+    st.dataframe(diag_df.round(4), width="stretch", hide_index=True)
+
+    csv_bytes = diag_df.round(4).to_csv(index=False).encode()
+    st.download_button(
+        label='⬇️ Download aggregated Statcast CSV',
+        data=csv_bytes,
+        file_name=f'statcast_aggregated_{start_str}_{end_str}.csv',
+        mime='text/csv'
+    )
+    st.caption(
+        'release_side = release_pos_x + (0.3655×ext − 2.4608). '
+        'hb: RHP = pfx_x×12, LHP = pfx_x×12×−1. All pitches, no windup filter.'
+    )
+
+# ─── Tab 5: Methodology ───────────────────────────────────────────────────────
+with tab5:
+    st.markdown("## Tunneling+ — Model Methodology")
+    st.caption(f"v18 · Statcast Edition · {start_str} to {end_str}")
+
+    st.markdown("---")
+    st.markdown("### What is Tunneling+?")
+    st.markdown(
+        "Tunneling+ measures how well a pitcher disguises his pitches through the "
+        "**tunnel point** — the moment roughly 23.8 ft from the plate where a hitter "
+        "must commit to swing or take. Pitches that look identical at the tunnel point "
+        "but diverge dramatically by the plate are the hardest to read. "
+        "Normalized within handedness: 100 = league average, 1 SD approx 15 points, "
+        "winsorized to [60, 160]."
+    )
+
+    st.markdown("---")
+    st.markdown("### Pair Classification")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.markdown("**Tunnel pair**")
+        st.markdown(
+            "Tunnel distance < 6.6 inches (league p50) "
+            "AND plate divergence ratio > 1.5x. "
+            "Pitches that converge at the commit point then break sharply apart."
+        )
+    with col_b:
+        st.markdown("**Speed-change pair**")
+        st.markdown(
+            "Plate distance < 14.9 inches (league p33) "
+            "AND velocity gap > 6.8 mph (league p50). "
+            "Same location, different speed — hitter commits before detecting the difference."
+        )
+    with col_c:
+        st.markdown("**Irrelevant pair**")
+        st.markdown(
+            "Neither condition met. Excluded for pitchers with at least one qualifying pair. "
+            "Pitchers with only irrelevant pairs are scored on raw metrics and "
+            "flagged 'Unclassified pairs.'"
+        )
+
+    st.markdown("---")
+    st.markdown("### Tunnel Composite Score")
+    st.markdown(
+        "Qualifying tunnel pairs are weighted by **usage x tunnel ratio** — "
+        "higher weight to elite, frequently-thrown pairs. "
+        "The composite is a weighted average of five components:"
+    )
+    components = [
+        ("35%", "Tunnel Ratio (TR)",
+         "Plate spread divided by tunnel distance. Primary signal — how much the pitch "
+         "breaks after the commit point relative to how tight it looks at the tunnel point."),
+        ("20%", "Break:Tunnel Ratio (BTR)",
+         "Additional plate spread beyond the tunnel distance. "
+         "Rewards pitches that break more than they tunnel."),
+        ("15%", "Interaction Index (IX)",
+         "Axis alignment combined with plate divergence. Rewards pitches that tunnel "
+         "on-axis but diverge sharply at the plate."),
+        ("15%", "Release:Tunnel Ratio (RTR) — inverted",
+         "Release spread relative to tunnel distance. Lower is better — a consistent "
+         "release slot hiding different pitches scores higher."),
+        ("10%", "Late Break Multiplier (LBM)",
+         "Rewards pitches with break concentrated after the tunnel point "
+         "rather than early in flight."),
+        ("5%",  "Velocity Differential (VD)",
+         "Absolute velocity gap between paired pitches. Modest contribution — "
+         "speed difference adds deception on top of movement."),
+    ]
+    for pct, name, desc in components:
+        st.markdown(f"**{pct} — {name}:** {desc}")
+        st.markdown("")
+
+    st.markdown("---")
+    st.markdown("### Final Composite and Normalization")
+    st.markdown(
+        "Final score = **80% tunnel composite + 20% temporal** (speed-change deception). "
+        "Both components are z-scored within handedness before combining, so RHP and LHP "
+        "are evaluated against their own peers. Converted to a 100-point scale "
+        "(mean=100, std approx 15), winsorized to [60, 160]. "
+        "Minimum 10 pitches per pitch type and 50 total pitches to qualify."
+    )
+
+    st.markdown("---")
+    st.markdown("### Data and Calibration")
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        st.markdown("**Source**")
+        st.markdown(
+            "Baseball Savant (Statcast) via pybaseball. "
+            "All pitches included — no runner or windup filter. "
+            "Data cached for 1 hour per date range."
+        )
+        st.markdown("**hb sign convention**")
+        st.markdown(
+            "Positive hb = arm side for that pitcher. "
+            "RHP: pfx_x x 12 x -1. "
+            "LHP: pfx_x x 12 (no flip). "
+            "Converts Statcast catcher-relative coordinates to pitcher-relative arm-side convention."
+        )
+    with cc2:
+        st.markdown("**release_side correction**")
+        st.markdown(
+            "release_side = release_pos_x + (0.3655 x extension - 2.4608). "
+            "Extension-based correction fitted from diagnostic analysis of "
+            "Statcast release_pos_x. "
+            "Reduces mean offset to under 0.03 ft per pitch type."
+        )
+        st.markdown("**Known limitation**")
+        st.markdown(
+            "Statcast release_pos_x has less within-pitcher spread across pitch types "
+            "than some reference implementations (avg 0.24 ft vs 0.33 ft). "
+            "This produces a Statcast-native calibration."
+        )
+
+    st.markdown("---")
+    st.markdown("### Model Constants")
+    const_data = {
+        "Tunnel point": "23.8 ft from plate",
+        "Tunnel threshold": "6.6 in (league p50 tunnel distance)",
+        "Min tunnel ratio": "1.5x",
+        "Speed-change plate threshold": "14.9 in (league p33)",
+        "Speed-change velo threshold": "6.8 mph (league p50)",
+        "League avg plate distance": "20.07 in",
+        "Min pitches per pitch type": "10",
+        "Min total pitches to qualify": "50",
+        "Score range": "60 to 160 (winsorized)",
+        "Normalization": "Within handedness, mean=100, std approx 15",
+    }
+    for k, v in const_data.items():
+        st.markdown(f"- **{k}:** {v}")
+
+    st.markdown("---")
+    st.caption("Tunneling+ v18 · By Robert Colonna · Built on Statcast via pybaseball")
+
+
+# ─── Tab 6: Tunnel Comps ──────────────────────────────────────────────────────
+
 # ─── Tab 6: Tunnel Comps ──────────────────────────────────────────────────────
 with tab6:
     st.markdown("### Pitcher Tunnel Comps")
