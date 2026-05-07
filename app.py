@@ -261,7 +261,7 @@ def get_league_pools(start: str, end: str):
     if key in store:
         _, pools_df = store[key]
     else:
-        _, pools_df = load_season_data(start, end)
+        _, pools_df, _ = load_season_data(start, end)
     return build_league_pools(pools_df)
 
 
@@ -622,10 +622,89 @@ with st.sidebar:
 # thread. st.cache_data decorators cannot be called from non-Streamlit threads
 # (they try to access ScriptRunContext and fail). The thread calls this directly;
 # the result is stored in sys.modules and the main thread reads it from there.
+def _compute_outcomes(df_raw):
+    """Derive per-pitcher outcome stats from raw Statcast pitch-level data.
+    Called before df_raw is trimmed so we still have all columns."""
+    import pandas as _pd2
+    import numpy as _np2
+
+    # Column name map — savant uses 'pitcher' for ID, 'player_name' for name
+    id_col   = 'pitcher'      if 'pitcher'      in df_raw.columns else None
+    name_col = 'player_name'  if 'player_name'  in df_raw.columns else None
+    if id_col is None or name_col is None:
+        return _pd2.DataFrame()
+
+    rows = []
+    for pid, grp in df_raw.groupby(id_col):
+        pname = grp[name_col].iloc[0] if name_col else str(pid)
+        n_pitches = len(grp)
+        if n_pitches < 50:
+            continue
+
+        # Whiff% = swinging strikes / total pitches
+        desc = grp['description'] if 'description' in grp.columns else _pd2.Series(dtype=str)
+        swings   = desc.isin(['swinging_strike', 'swinging_strike_blocked', 'foul', 'foul_tip', 'hit_into_play', 'hit_into_play_no_out', 'hit_into_play_score'])
+        whiffs   = desc.isin(['swinging_strike', 'swinging_strike_blocked'])
+        whiff_pct = float(whiffs.sum() / n_pitches * 100) if n_pitches > 0 else None
+
+        # Called strike + whiff % (CSW)
+        called_strikes = desc.isin(['called_strike'])
+        csw_pct = float((whiffs.sum() + called_strikes.sum()) / n_pitches * 100) if n_pitches > 0 else None
+
+        # GB% — of balls in play
+        bb_type = grp['bb_type'] if 'bb_type' in grp.columns else _pd2.Series(dtype=str)
+        bip = bb_type.notna() & (bb_type != '')
+        gb  = bb_type == 'ground_ball'
+        gb_pct = float(gb.sum() / bip.sum() * 100) if bip.sum() > 0 else None
+        fb_pct = float((bb_type == 'fly_ball').sum() / bip.sum() * 100) if bip.sum() > 0 else None
+
+        # K% and BB% — from plate appearances (events column)
+        events = grp['events'] if 'events' in grp.columns else _pd2.Series(dtype=str)
+        pa_events = events.notna() & (events != '')
+        n_pa = pa_events.sum()
+        k_pct  = float(events.isin(['strikeout','strikeout_double_play']).sum() / n_pa * 100) if n_pa > 0 else None
+        bb_pct = float(events.isin(['walk','intent_walk']).sum() / n_pa * 100) if n_pa > 0 else None
+
+        # xwOBA — mean of estimated_woba_using_speedangle where available
+        xwoba_col = 'estimated_woba_using_speedangle'
+        xwoba = float(grp[xwoba_col].dropna().mean()) if xwoba_col in grp.columns else None
+
+        # Barrel% — launch_speed >= 98 and launch_angle 26-30
+        if 'launch_speed' in grp.columns and 'launch_angle' in grp.columns:
+            bip_df  = grp[bip].copy() if bip.sum() > 0 else grp.iloc[0:0]
+            barrels = bip_df[
+                (bip_df['launch_speed'] >= 98) &
+                (bip_df['launch_angle'].between(26, 30))
+            ]
+            barrel_pct = float(len(barrels) / bip.sum() * 100) if bip.sum() > 0 else None
+        else:
+            barrel_pct = None
+
+        rows.append({
+            'pitcher_id': int(pid),
+            'sv_name':    pname,
+            'n_pitches':  n_pitches,
+            'whiff_pct':  round(whiff_pct, 2)  if whiff_pct  is not None else None,
+            'csw_pct':    round(csw_pct, 2)    if csw_pct    is not None else None,
+            'gb_pct':     round(gb_pct, 2)     if gb_pct     is not None else None,
+            'fb_pct':     round(fb_pct, 2)     if fb_pct     is not None else None,
+            'k_pct':      round(k_pct, 2)      if k_pct      is not None else None,
+            'bb_pct':     round(bb_pct, 2)     if bb_pct     is not None else None,
+            'xwoba':      round(xwoba, 4)      if xwoba      is not None else None,
+            'barrel_pct': round(barrel_pct, 2) if barrel_pct is not None else None,
+        })
+
+    return _pd2.DataFrame(rows)
+
+
 def _load_season_data_direct(start: str, end: str):
     df_raw = load_statcast(start, end, verbose=False)
     c, f   = run_model(df_raw)
     q      = normalize(c, f)
+
+    # Compute outcome stats from full df_raw BEFORE trimming it
+    outcomes = _compute_outcomes(df_raw)
+
     # Trim df_raw to only the columns downstream code actually needs.
     # This dramatically reduces RAM — the full df_raw may have dozens of extra
     # Statcast columns never used after this point. Freeing it before storing
@@ -640,7 +719,7 @@ def _load_season_data_direct(start: str, end: str):
     _keep = [col for col in _POOLS_COLS if col in df_raw.columns]
     pools = df_raw[_keep].copy()
     del df_raw  # free the full table immediately
-    return q, pools
+    return q, pools, outcomes
 
 # Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -780,7 +859,7 @@ if _err_key in _tplus_store:
     st.exception(_tplus_store[_err_key])
     st.stop()
 
-lb, pools = _tplus_store[_cache_key]
+lb, pools, outcomes_df = _tplus_store[_cache_key]
 
 # Filter and rerank
 lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
@@ -1347,19 +1426,19 @@ with tab7:
         "League-level correlations and per-pitcher expected vs. actual breakdown."
     )
 
-    # ── Load outcome data ──────────────────────────────────────────────────────
-    outcomes = load_outcome_data(season)
+    # ── Outcomes computed from same Statcast pull — no extra network call ────────
+    outcomes = outcomes_df  # derived in _load_season_data_direct before df_raw trim
 
-    if outcomes.empty:
+    if outcomes is None or outcomes.empty:
         st.warning(
-            "Could not load FanGraphs outcome data. "
-            "Check that pybaseball is installed and FanGraphs is reachable."
+            "Outcome data could not be computed from the Statcast pull. "
+            "This may happen if the raw pitch data is missing expected columns "
+            "(description, events, bb_type, launch_speed, launch_angle)."
         )
     else:
-        # ── Join tunneling metrics with outcomes ───────────────────────────────
-        # Match on name (FanGraphs name vs pitcher_name in lb_filtered)
+        # ── Join tunneling metrics with outcomes on pitcher_id ─────────────────
         lb_corr = lb_filtered[
-            ['name', 'hand', 'team', 'pitches',
+            ['pitcher_id', 'name', 'hand', 'team', 'pitches',
              'tunneling_plus', 'tp_pct',
              'avg_tunnel_ratio', 'tr_pct',
              'n_speed_pairs', 'spd_pct',
@@ -1369,28 +1448,26 @@ with tab7:
 
         merged = lb_corr.merge(
             outcomes,
-            left_on='name', right_on='fg_name',
+            on='pitcher_id',
             how='inner'
         )
 
         if len(merged) < 10:
             st.warning(
-                f"Only {len(merged)} pitchers matched between tunneling and FanGraphs data. "
-                "Name format differences may be causing mismatches."
+                f"Only {len(merged)} pitchers matched on pitcher_id. "
+                f"lb_filtered has {len(lb_corr)} pitchers, outcomes has {len(outcomes)}."
             )
 
         # ── Outcome columns available ──────────────────────────────────────────
         OUTCOME_COLS = {
-            'whiff_pct':    'Whiff%',
-            'swstr_pct':    'SwStr%',
-            'gb_pct':       'GB%',
-            'k_pct':        'K%',
-            'bb_pct':       'BB%',
-            'xfip':         'xFIP',
-            'xera':         'xERA',
-            'o_swing_pct':  'O-Swing%',
-            'csw_pct':      'CSW%',
-            'babip':        'BABIP',
+            'whiff_pct':  'Whiff%',
+            'csw_pct':    'CSW%',
+            'gb_pct':     'GB%',
+            'fb_pct':     'FB%',
+            'k_pct':      'K%',
+            'bb_pct':     'BB%',
+            'xwoba':      'xwOBA',
+            'barrel_pct': 'Barrel%',
         }
         TUNNEL_COLS = {
             'tunneling_plus':  'T+',
@@ -1625,7 +1702,7 @@ with tab7:
             "compared to actual results."
         )
 
-        all_pitcher_names = sorted(merged['name'].tolist())
+        all_pitcher_names = sorted(merged['name'].dropna().unique().tolist())
         _sel_default = st.session_state.get('selected_pitcher', all_pitcher_names[0] if all_pitcher_names else None)
         _sel_idx = all_pitcher_names.index(_sel_default) if _sel_default in all_pitcher_names else 0
         sel_pitcher = st.selectbox(
@@ -1670,7 +1747,7 @@ with tab7:
 
                     # Is actual better/worse/neutral vs predicted?
                     # For ERA/FIP lower is better; for whiff/K higher is better
-                    _lower_is_better = ocol in ('xfip', 'xera', 'bb_pct', 'babip', 'hr_per_fb')
+                    _lower_is_better = ocol in ('xwoba', 'barrel_pct', 'bb_pct', 'fb_pct')
                     if _lower_is_better:
                         verdict = '✅ Better' if actual < exp_lo else ('⚠️ Worse' if actual > exp_hi else '➖ In range')
                     else:
