@@ -747,6 +747,48 @@ lb_filtered['rank'] = lb_filtered['tunneling_plus'].rank(
 lb_filtered['tp_pct'] = lb_filtered['tunneling_plus'].rank(
     pct=True).mul(100).round(0).astype(int)
 
+# ── Compute percentile columns for leaderboard display ────────────────────────
+# Tunnel ratio percentile (higher = better)
+lb_filtered['tr_pct'] = lb_filtered['avg_tunnel_ratio'].rank(
+    pct=True).mul(100).round(0).astype(int)
+
+# Speed-change percentile (higher n_speed_pairs = better)
+lb_filtered['spd_pct'] = lb_filtered['n_speed_pairs'].rank(
+    pct=True).mul(100).round(0).astype(int)
+
+# Release consistency: compute per-pitcher weighted avg release distance from pools
+# Lower rd = tighter release = better, so we invert the percentile
+def _compute_rc(pools_df, pitcher_ids):
+    from itertools import combinations as _comb
+    rc_map = {}
+    for pid, grp in pools_df.groupby('pitcher_id'):
+        if pid not in pitcher_ids:
+            continue
+        grp = grp[grp['pitches'] >= 10].copy()
+        if len(grp) < 2:
+            continue
+        total = grp['pitches'].sum()
+        grp['pitch_frac'] = grp['pitches'] / total
+        rc_w = []
+        for (_, r1), (_, r2) in _comb(grp.iterrows(), 2):
+            if 'rel_x' not in r1 or 'rel_x' not in r2:
+                continue
+            rd = float(np.sqrt((r1['rel_x']-r2['rel_x'])**2+(r1['rel_z']-r2['rel_z'])**2))
+            uw = float(r1['pitch_frac'] * r2['pitch_frac'])
+            rc_w.append((rd, uw))
+        if rc_w:
+            tw = sum(x[1] for x in rc_w)
+            rc_map[pid] = sum(x[0]*x[1] for x in rc_w) / tw
+    return rc_map
+
+_rc_map = _compute_rc(pools, set(lb_filtered['pitcher_id'].tolist()))
+lb_filtered['rc_val'] = lb_filtered['pitcher_id'].map(_rc_map)
+# Invert: lower release distance = higher percentile (tighter = better)
+lb_filtered['rc_pct'] = (
+    lb_filtered['rc_val'].rank(pct=True, ascending=False)
+    .mul(100).round(0).fillna(50).astype(int)
+)
+
 for hand in ['R', 'L']:
     mask = lb_filtered['hand'] == hand
     lb_filtered.loc[mask, 'total_hand'] = int(mask.sum())
@@ -785,14 +827,17 @@ with tab1:
         display = display[display['hand'] == hand_sel]
 
     show_cols = ['rank', 'tunneling_plus', 'tp_pct', 'name', 'team', 'hand',
-                 'pitches', 'n_types', 'n_tunnel_pairs', 'avg_tunnel_ratio',
-                 'n_speed_pairs', 'temporal']
+                 'pitches',
+                 'avg_tunnel_ratio', 'tr_pct',
+                 'n_speed_pairs',    'spd_pct',
+                 'rc_val',           'rc_pct']
     col_names = {
         'rank': 'Rank', 'tunneling_plus': 'T+', 'tp_pct': 'Pct',
         'name': 'Pitcher', 'team': 'Team', 'hand': 'Hand',
-        'pitches': 'Pitches', 'n_types': 'Types',
-        'n_tunnel_pairs': 'Tun Pairs', 'avg_tunnel_ratio': 'Avg Ratio',
-        'n_speed_pairs': 'Spd Pairs', 'temporal': 'Temporal'
+        'pitches': 'Pitches',
+        'avg_tunnel_ratio': 'Tun Ratio', 'tr_pct':  'TR Pct',
+        'n_speed_pairs':    'Spd Pairs', 'spd_pct': 'Spd Pct',
+        'rc_val':           'Rel Cons',  'rc_pct':  'RC Pct',
     }
     disp = display[show_cols].rename(columns=col_names)
     st.dataframe(
@@ -800,18 +845,19 @@ with tab1:
         width="stretch",
         hide_index=True,
         column_config={
-            'Rank':      st.column_config.NumberColumn(width='small'),
-            'T+':        st.column_config.NumberColumn(format='%.1f', width='small'),
-            'Pct':       st.column_config.NumberColumn(format='%d', width='small'),
-            'Pitcher':   st.column_config.TextColumn(width='medium'),
-            'Team':      st.column_config.TextColumn(width='small'),
-            'Hand':      st.column_config.TextColumn(width='small'),
-            'Pitches':   st.column_config.NumberColumn(width='small'),
-            'Types':     st.column_config.NumberColumn(width='small'),
-            'Tun Pairs': st.column_config.NumberColumn(width='small'),
-            'Avg Ratio': st.column_config.NumberColumn(format='%.3f', width='medium'),
-            'Spd Pairs': st.column_config.NumberColumn(width='small'),
-            'Temporal':  st.column_config.NumberColumn(format='%.4f', width='medium'),
+            'Rank':     st.column_config.NumberColumn(width='small'),
+            'T+':       st.column_config.NumberColumn(format='%.1f', width='small'),
+            'Pct':      st.column_config.NumberColumn(format='%d',   width='small'),
+            'Pitcher':  st.column_config.TextColumn(width='medium'),
+            'Team':     st.column_config.TextColumn(width='small'),
+            'Hand':     st.column_config.TextColumn(width='small'),
+            'Pitches':  st.column_config.NumberColumn(width='small'),
+            'Tun Ratio':st.column_config.NumberColumn(format='%.3f', width='medium'),
+            'TR Pct':   st.column_config.NumberColumn(format='%d',   width='small'),
+            'Spd Pairs':st.column_config.NumberColumn(width='small'),
+            'Spd Pct':  st.column_config.NumberColumn(format='%d',   width='small'),
+            'Rel Cons': st.column_config.NumberColumn(format='%.2f', width='medium'),
+            'RC Pct':   st.column_config.NumberColumn(format='%d',   width='small'),
         }
     )
     st.caption(f'Showing {len(disp)} of {total_q} qualified pitchers')
