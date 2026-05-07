@@ -601,9 +601,10 @@ def _compute_outcomes(df_raw):
         whiffs   = desc.isin(['swinging_strike', 'swinging_strike_blocked'])
         whiff_pct = float(whiffs.sum() / n_pitches * 100) if n_pitches > 0 else None
 
-        # Called strike + whiff % (CSW)
+        # Called strike + whiff % (CSW) and pure called strike %
         called_strikes = desc.isin(['called_strike'])
         csw_pct = float((whiffs.sum() + called_strikes.sum()) / n_pitches * 100) if n_pitches > 0 else None
+        called_strike_pct = float(called_strikes.sum() / n_pitches * 100) if n_pitches > 0 else None
 
         # GB% — of balls in play
         bb_type = grp['bb_type'] if 'bb_type' in grp.columns else _pd2.Series(dtype=str)
@@ -638,8 +639,9 @@ def _compute_outcomes(df_raw):
             'pitcher_id': int(pid),
             'sv_name':    pname,
             'n_pitches':  n_pitches,
-            'whiff_pct':  round(whiff_pct, 2)  if whiff_pct  is not None else None,
-            'csw_pct':    round(csw_pct, 2)    if csw_pct    is not None else None,
+            'whiff_pct':        round(whiff_pct, 2)         if whiff_pct         is not None else None,
+            'csw_pct':          round(csw_pct, 2)           if csw_pct           is not None else None,
+            'called_strike_pct': round(called_strike_pct, 2) if called_strike_pct is not None else None,
             'gb_pct':     round(gb_pct, 2)     if gb_pct     is not None else None,
             'fb_pct':     round(fb_pct, 2)     if fb_pct     is not None else None,
             'k_pct':      round(k_pct, 2)      if k_pct      is not None else None,
@@ -1573,24 +1575,25 @@ with tab7:
 
             # ── Column definitions ─────────────────────────────────────────────
             OUTCOME_LABELS = {
-                'whiff_pct':     'Whiff%',
-                'k_pct':         'K%',
-                'bb_pct':        'BB%',
-                'chase_pct':     'Chase%',
-                'o_swing_pct':   'O-Swing%',
-                'z_contact_pct': 'Z-Contact%',
-                'csw_pct':       'CSW%',
-                'gb_pct':        'GB%',
-                'barrel_pct':    'Barrel%',
-                'hard_hit_pct':  'Hard Hit%',
-                'xwoba':         'xwOBA',
-                'xera':          'xERA',
-                'xba':           'xBA',
-                'era':           'ERA',
-                'whip':          'WHIP',
-                'baa':           'AVG Against',
-                'so':            'Strikeouts',
-                'ip':            'IP',
+                'whiff_pct':          'Whiff%',
+                'k_pct':              'K%',
+                'bb_pct':             'BB%',
+                'chase_pct':          'Chase%',
+                'o_swing_pct':        'O-Swing%',
+                'z_contact_pct':      'Z-Contact%',
+                'csw_pct':            'CSW%',
+                'called_strike_pct':  'Called Strike%',
+                'gb_pct':             'GB%',
+                'barrel_pct':         'Barrel%',
+                'hard_hit_pct':       'Hard Hit%',
+                'xwoba':              'xwOBA',
+                'xera':               'xERA',
+                'xba':                'xBA',
+                'era':                'ERA',
+                'whip':               'WHIP',
+                'baa':                'AVG Against',
+                'so':                 'Strikeouts',
+                'ip':                 'IP',
             }
             TUNNEL_COLS = {
                 'tunneling_plus':   'T+',
