@@ -1482,19 +1482,19 @@ with tab7:
 
             # ── Column definitions ─────────────────────────────────────────────
             OUTCOME_LABELS = {
-                'whiff_pct':    'Whiff%',
-                'k_pct':        'K%',
-                'bb_pct':       'BB%',
-                'chase_pct':    'Chase%',
-                'o_swing_pct':  'O-Swing%',
-                'gb_pct':       'GB%',
-                'barrel_pct':   'Barrel%',
-                'hard_hit_pct': 'Hard Hit%',
-                'csw_pct':      'CSW%',
-                'z_contact_pct':'Z-Contact%',
-                'xwoba':        'xwOBA',
-                'xera':         'xERA',
-                'xba':          'xBA',
+                'whiff_pct':     'Whiff%',
+                'k_pct':         'K%',
+                'bb_pct':        'BB%',
+                'chase_pct':     'Chase%',
+                'o_swing_pct':   'O-Swing%',
+                'z_contact_pct': 'Z-Contact%',
+                'csw_pct':       'CSW%',
+                'gb_pct':        'GB%',
+                'barrel_pct':    'Barrel%',
+                'hard_hit_pct':  'Hard Hit%',
+                'xwoba':         'xwOBA',
+                'xera':          'xERA',
+                'xba':           'xBA',
             }
             TUNNEL_COLS = {
                 'tunneling_plus':   'T+',
@@ -1520,7 +1520,7 @@ with tab7:
                 all_names_corr = sorted(merged['name'].dropna().unique().tolist())
                 _def = st.session_state.get('selected_pitcher', all_names_corr[0] if all_names_corr else None)
                 _idx = all_names_corr.index(_def) if _def in all_names_corr else 0
-                hl_pitcher = st.selectbox('View pitcher (or All pitchers)', ['(none)'] + all_names_corr, index=_idx + 1, key='corr_hl')
+                hl_pitcher = st.selectbox('View pitcher (or All pitchers)', ['All Pitchers'] + all_names_corr, index=0, key='corr_hl')
 
             x_col = [k for k, v in avail_tunnel.items()   if v == x_label][0]
             y_col = [k for k, v in avail_outcomes.items() if v == y_label][0]
@@ -1532,7 +1532,7 @@ with tab7:
             st.markdown("---")
             st.markdown("#### Scatter Explorer")
 
-            _solo_mode = hl_pitcher != '(none)'
+            _solo_mode = hl_pitcher != 'All Pitchers'
 
             if _solo_mode:
                 st.markdown(
@@ -1677,90 +1677,3 @@ with tab7:
                 else:
                     st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; Hover for details")
 
-            # ══════════════════════════════════════════════════════════════════
-            # SECTION 2: League correlation table (same outcome as scatter)
-            # ══════════════════════════════════════════════════════════════════
-            st.markdown("---")
-            st.markdown("#### League-Wide Correlations")
-            st.markdown(
-                f"How strongly each tunneling metric correlates with **{y_label}** across all {len(merged)} pitchers. "
-                "Pearson r ranges from -1 to +1. Values near 0 mean little relationship. "
-                f"{'A *negative* r is the good direction here — lower '+y_label+' is better for the pitcher.' if y_col in ('xwoba','xera','barrel_pct','bb_pct') else 'A *positive* r means the metric predicts better outcomes.'}"
-            )
-
-            # Build one row per tunneling metric for the selected outcome only
-            corr_rows = []
-            for tcol, tlabel in avail_tunnel.items():
-                pair = merged[[tcol, y_col]].dropna()
-                if len(pair) >= 8:
-                    r = round(float(pair[tcol].corr(pair[y_col])), 3)
-                    # Also compute r for all outcomes for completeness
-                    corr_rows.append({'Tunneling Metric': tlabel, f'r vs {y_label}': r, 'n': len(pair)})
-
-            if corr_rows:
-                corr_tbl = pd.DataFrame(corr_rows).sort_values(f'r vs {y_label}', key=abs, ascending=False)
-                st.dataframe(corr_tbl, hide_index=True, width='stretch',
-                    column_config={{
-                        f'r vs {y_label}': st.column_config.NumberColumn(format='%.3f'),
-                        'n': st.column_config.NumberColumn('Sample', width='small'),
-                    }})
-
-            # ══════════════════════════════════════════════════════════════════
-            # SECTION 3: Individual pitcher breakdown (same axes)
-            # ══════════════════════════════════════════════════════════════════
-            st.markdown("---")
-            st.markdown("#### Individual Pitcher Breakdown")
-            st.markdown(
-                f"What does **{hl_pitcher if hl_pitcher != '(none)' else 'the selected pitcher'}**'s tunneling profile predict for their outcomes, "
-                "and how do their actual results compare? "
-                "**Predicted** is from linear regression of each metric vs that outcome league-wide. "
-                "**Exp Range** is ±1 SD — where ~68% of similar pitchers land. "
-                "✅ outperforming · ⚠️ underperforming · ➖ within expected range."
-            )
-
-            sel = hl_pitcher if hl_pitcher != '(none)' else (all_names_corr[0] if all_names_corr else None)
-
-            if sel and sel in merged['name'].values:
-                pr = merged[merged['name'] == sel].iloc[0]
-                st.markdown(f"**{sel}** &nbsp;·&nbsp; {pr.get('team','')} &nbsp;·&nbsp; {pr.get('hand','')}HP")
-
-                rows_bd = []
-                for tcol, tlabel in avail_tunnel.items():
-                    for ocol, olabel in avail_outcomes.items():
-                        pair = merged[[tcol, ocol]].dropna()
-                        if len(pair) < 8: continue
-                        r = float(pair[tcol].corr(pair[ocol]))
-                        if abs(r) < 0.10: continue
-                        _xv = pair[tcol].values.astype(float)
-                        _yv = pair[ocol].values.astype(float)
-                        _co = np.polyfit(_xv, _yv, 1)
-                        _m, _b = float(_co[0]), float(_co[1])
-                        pred   = _m * float(pr[tcol]) + _b
-                        sd     = float(np.std(_yv - (_m * _xv + _b)))
-                        actual = pr.get(ocol, None)
-                        if pd.isna(actual): continue
-                        actual = float(actual)
-                        _low = ocol in ('xwoba','xera','barrel_pct','bb_pct','hard_hit_pct')
-                        if _low:
-                            verdict = '✅ Better' if actual < pred-sd else ('⚠️ Worse' if actual > pred+sd else '➖ In range')
-                        else:
-                            verdict = '✅ Better' if actual > pred+sd else ('⚠️ Worse' if actual < pred-sd else '➖ In range')
-                        rows_bd.append({
-                            'Tunnel Metric': tlabel, 'Outcome': olabel,
-                            'r': round(r,3), 'Predicted': round(pred,3),
-                            'Exp Range': f'{pred-sd:.2f} – {pred+sd:.2f}',
-                            'Actual': round(actual,3), 'vs Expected': verdict,
-                        })
-
-                if rows_bd:
-                    bd_df = pd.DataFrame(rows_bd).sort_values(['Outcome','Tunnel Metric'])
-                    st.dataframe(bd_df, hide_index=True, width='stretch',
-                        column_config={{
-                            'r':         st.column_config.NumberColumn('Pearson r', format='%.3f', width='small'),
-                            'Predicted': st.column_config.NumberColumn(format='%.3f', width='small'),
-                            'Actual':    st.column_config.NumberColumn(format='%.3f', width='small'),
-                        }})
-                else:
-                    st.info("No correlations strong enough (|r| ≥ 0.10) for this pitcher.")
-            else:
-                st.info("Select a pitcher in the Highlight pitcher dropdown above to see their breakdown.")
