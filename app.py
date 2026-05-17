@@ -17,6 +17,21 @@ import tempfile
 from datetime import date, datetime, timezone, timedelta
 from itertools import combinations
 
+import threading
+import urllib.request
+
+def _keep_alive():
+    """Ping this app every 4 hours to prevent sleep."""
+    import time
+    while True:
+        time.sleep(4 * 60 * 60)  # 4 hours
+        try:
+            urllib.request.urlopen("https://YOUR-APP-URL.streamlit.app", timeout=10)
+        except Exception:
+            pass  # Silently ignore any errors
+
+_t = threading.Thread(target=_keep_alive, daemon=True)
+_t.start()
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Set Playwright browser path before any playwright import ──────────────────
