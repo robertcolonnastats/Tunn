@@ -888,23 +888,13 @@ with st.sidebar:
         st.rerun()
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-# NOTE: _load_season_data_direct is the raw function used by the background
-# thread. st.cache_data decorators cannot be called from non-Streamlit threads
-# (they try to access ScriptRunContext and fail). The thread calls this directly;
-# the result is stored in sys.modules and the main thread reads it from there.
-def _load_season_data_direct(start: str, end: str):
-    df_raw = load_statcast(start, end, verbose=False)
-    # Release the raw Statcast payload as soon as the model finishes so memory
-    # pressure stays lower on resource-constrained deployments.
-    c, f = run_model(df_raw)
-    q = normalize(c, f)
-    del df_raw
-    return q, None
-
-# Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_season_data(start: str, end: str):
-    return _load_season_data_direct(start, end)
+# NOTE: _load_season_data_direct (defined earlier, ~line 673) is the raw function
+# used by the background thread. st.cache_data decorators cannot be called from
+# non-Streamlit threads (they try to access ScriptRunContext and fail). The thread
+# calls it directly; the result is stored in sys.modules and the main thread reads
+# it from there. Do NOT redefine _load_season_data_direct/load_season_data here —
+# a duplicate definition previously shadowed the original and made it return
+# `None` instead of `pools`, which broke every pitcher_id-keyed lookup downstream.
 
 # Use sys.modules to store results — truly process-global, survives reruns.
 import threading, time as _time, sys as _sys
