@@ -277,6 +277,8 @@ def get_league_pools(start: str, end: str):
         _, pools_df = store[key]
     else:
         _, pools_df = load_season_data(start, end)
+    if pools_df is None:
+        return {'ratios': [], 'temporal': [], 'tr_pp': [], 'rc_pp': [], 'tm_pp': []}
     return build_league_pools(pools_df)
 
 
@@ -860,7 +862,7 @@ with st.sidebar:
     with col_d1:
         start_date = st.date_input(
             'From',
-            value=date(season, 3, 27),
+            value=date.today() - timedelta(days=30),
             min_value=date(2021, 1, 1),
             max_value=date.today(),
         )
@@ -892,9 +894,12 @@ with st.sidebar:
 # the result is stored in sys.modules and the main thread reads it from there.
 def _load_season_data_direct(start: str, end: str):
     df_raw = load_statcast(start, end, verbose=False)
-    c, f   = run_model(df_raw)
-    q      = normalize(c, f)
-    return q, df_raw
+    # Release the raw Statcast payload as soon as the model finishes so memory
+    # pressure stays lower on resource-constrained deployments.
+    c, f = run_model(df_raw)
+    q = normalize(c, f)
+    del df_raw
+    return q, None
 
 # Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -973,12 +978,22 @@ if _cache_key not in _tplus_store:
     _time.sleep(2)
     st.rerun()
 
+# If the background thread never populated the cache, fall back to a direct
+# load in the main thread so the app does not crash on a cold start.
+if _cache_key not in _tplus_store and _err_key not in _tplus_store:
+    try:
+        _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
+    except Exception as exc:
+        _tplus_store[_err_key] = exc
+
 if _err_key in _tplus_store:
     st.error(f'Failed to load data: {_tplus_store[_err_key]}')
     st.exception(_tplus_store[_err_key])
     st.stop()
 
 lb, pools = _tplus_store[_cache_key]
+if pools is None:
+    pools = pd.DataFrame()
 
 # Filter and rerank
 lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
@@ -1127,7 +1142,7 @@ with tab2:
     playwright_ok = True
     try:
         from playwright.async_api import async_playwright  # noqa
-    except ImportError:
+    except Exception:
         playwright_ok = False
 
     if selected:
@@ -1161,15 +1176,36 @@ with tab2:
                         st.error(f'No pitch-level data found for {selected}.')
                     else:
                         html      = make_card_html(info)
-                        jpg_bytes = render_card(html)
-                        st.image(jpg_bytes, width=720)
-                        slug = selected.lower().replace(' ', '_').replace('.', '')
-                        st.download_button(
-                            label='⬇️ Download card JPG',
-                            data=jpg_bytes,
-                            file_name=f'{slug}_tunneling_card.jpg',
-                            mime='image/jpeg'
-                        )
+                        try:
+                            jpg_bytes = render_card(html)
+                            st.image(jpg_bytes, width=720)
+                            slug = selected.lower().replace(' ', '_').replace('.', '')
+                            st.download_button(
+                                label='⬇️ Download card JPG',
+                                data=jpg_bytes,
+                                file_name=f'{slug}_tunneling_card.jpg',
+                                mime='image/jpeg'
+                            )
+                        except Exception as render_err:
+                            st.warning(
+                                'Card rendering failed, showing text-only view instead. '
+                                f'{render_err}'
+                            )
+                            # Fall back to the same text card summary.
+                            tp  = lb_row['tunneling_plus']
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric('T+', f'{tp:.1f}')
+                            c2.metric('Percentile', f'{int(lb_row["tp_pct"])}th')
+                            c3.metric('Tunnel Pairs', int(lb_row['n_tunnel_pairs']))
+                            c4.metric('Avg Ratio', f'{lb_row["avg_tunnel_ratio"]:.3f}x')
+                            details = lb_row.get('pitch_details', [])
+                            if isinstance(details, str): details = json.loads(details)
+                            if details:
+                                adf = pd.DataFrame(sorted(details, key=lambda x: -x['frac']))
+                                adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
+                                                          'ivb':'IVB','hb':'HB','frac':'Usage%'})
+                                cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
+                                st.dataframe(adf[cols], width="stretch", hide_index=True)
                 except Exception as e:
                     st.error(f'Card render failed: {e}')
                     st.exception(e)
