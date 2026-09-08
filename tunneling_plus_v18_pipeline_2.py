@@ -103,93 +103,172 @@ def compute_tunnel_composite(tunnel_pairs):
 
 
 # ── Statcast data loading ─────────────────────────────────────────────────────
+def _iter_month_chunks(start_date, end_date):
+    """Split a date range into calendar-month chunks (YYYY-MM-DD strings).
+
+    Pulling the whole season in a single statcast() call holds every pitch
+    for the entire range in memory at once — fine early in the season, but
+    grows all year and can OOM a memory-capped host (e.g. Streamlit Cloud's
+    free tier) once several months have accumulated. Chunking by month caps
+    peak memory to roughly one month of pitches regardless of how far along
+    the season is.
+    """
+    import calendar
+    from datetime import date, timedelta
+
+    start = date.fromisoformat(start_date)
+    end   = date.fromisoformat(end_date)
+
+    chunks = []
+    cur = start
+    while cur <= end:
+        last_day  = calendar.monthrange(cur.year, cur.month)[1]
+        chunk_end = min(date(cur.year, cur.month, last_day), end)
+        chunks.append((cur.isoformat(), chunk_end.isoformat()))
+        cur = chunk_end + timedelta(days=1)
+    return chunks
+
+
 def load_statcast(start_date, end_date, verbose=True):
     """
-    Pull raw Statcast, aggregate per pitcher/pitch-type,
-    apply all calibration fixes, compute geometry — returns
-    the same df format as V17's load_data().
+    Pull raw Statcast in monthly chunks (keeps peak memory bounded as the
+    season grows), aggregate per pitcher/pitch-type, apply all calibration
+    fixes, compute geometry — returns the same df format as V17's load_data().
     """
     from pybaseball import statcast
     from pybaseball import cache as pb_cache
     pb_cache.enable()
 
-    if verbose:
-        print(f'  Fetching Statcast {start_date} → {end_date}...')
-    raw = statcast(start_date, end_date)
-
-    if verbose:
-        print(f'  Raw rows: {len(raw):,}')
-
-    # ── Filter 1: valid pitch types ───────────────────────────────────────────
-    raw = raw[raw['pitch_type'].isin(VALID_TYPES)].copy()
-
-    # ── Filter 2: non-null movement and release data ──────────────────────────
     required = ['pfx_x','pfx_z','release_pos_x','release_pos_z',
                 'release_extension','release_speed']
-    raw = raw[raw[required].notna().all(axis=1)]
-
-    # ── Filter 3: sane velocity ───────────────────────────────────────────────
-    raw = raw[raw['release_speed'].between(50, 110)]
 
     # NOTE: No windup filter applied. TJ Stats uses all pitches regardless of
     # runners on base. Windup-only shifts hb/ivb averages enough to push
     # SL/CU tunnel distance below the 0.5" floor, silently dropping the pair.
 
-    # ── Build hand map first (needed for hb sign) ───────────────────────────
-    hand_map = {}
-    if 'p_throws' in raw.columns:
-        for pid, grp in raw.groupby('pitcher'):
-            h = grp['p_throws'].mode()
-            if len(h):
-                hand_map[int(pid)] = h.iloc[0]
+    hand_counts = {}   # pid -> {'L': n_pitches, 'R': n_pitches}
+    name_map    = {}   # pid -> name (first seen)
+    team_map    = {}   # pid -> team (overwritten chunk by chunk, chronological)
+    partials    = []   # small per-chunk sum/count rows — never the raw pitches
 
-    # ── Compute hb with hand-dependent sign fix ───────────────────────────────
-    # Statcast pfx_x * 12 * -1 gives correct arm-side hb for RHP.
-    # For LHP the same formula inverts the sign — so LHP needs pfx_x * 12 (no flip).
-    # Result: positive hb = arm side for that pitcher, matching TJ Stats convention.
-    if 'p_throws' in raw.columns:
-        raw['hb'] = np.where(
-            raw['p_throws'] == 'L',
-            raw['pfx_x'] * 12,          # LHP: no flip
-            raw['pfx_x'] * 12 * -1      # RHP: flip
-        )
-    else:
-        raw['hb'] = raw['pfx_x'] * 12 * -1  # default RHP convention
-    raw['ivb'] = raw['pfx_z'] * 12
+    chunks = _iter_month_chunks(start_date, end_date)
+    total_rows = 0
 
-    # ── Aggregate per pitcher/pitch-type ─────────────────────────────────────
+    for i, (c_start, c_end) in enumerate(chunks, 1):
+        if verbose:
+            print(f'  Fetching Statcast chunk {i}/{len(chunks)}: {c_start} → {c_end}...')
+        chunk = statcast(c_start, c_end)
 
-    # Team: most recent game's fielding team
-    team_map = {}
-    if 'home_team' in raw.columns and 'inning_topbot' in raw.columns:
-        raw['_pitcher_team'] = np.where(
-            raw['inning_topbot'] == 'Top',
-            raw['home_team'],
-            raw['away_team'] if 'away_team' in raw.columns else raw['home_team']
-        )
-        for pid, grp in raw.groupby('pitcher'):
-            team_map[int(pid)] = grp['_pitcher_team'].iloc[-1]
+        if chunk is None or len(chunk) == 0:
+            continue
+        total_rows += len(chunk)
 
-    # Name map
-    name_map = {}
-    if 'player_name' in raw.columns:
-        for pid, grp in raw.groupby('pitcher'):
-            nm = grp['player_name'].iloc[0]
-            # Statcast gives "Last, First" — flip to "First Last"
-            if isinstance(nm, str) and ',' in nm:
-                parts = nm.split(',', 1)
-                nm = parts[1].strip() + ' ' + parts[0].strip()
-            name_map[int(pid)] = nm
+        # ── Filter 1: valid pitch types ───────────────────────────────────
+        chunk = chunk[chunk['pitch_type'].isin(VALID_TYPES)].copy()
 
-    agg = raw.groupby(['pitcher','pitch_type']).agg(
-        n               = ('release_speed','count'),
-        velo            = ('release_speed','mean'),
-        ivb             = ('ivb','mean'),
-        hb              = ('hb','mean'),
-        extension       = ('release_extension','mean'),
-        release_height  = ('release_pos_z','mean'),
-        release_side_raw= ('release_pos_x','mean'),
+        # ── Filter 2: non-null movement and release data ──────────────────
+        chunk = chunk[chunk[required].notna().all(axis=1)]
+
+        # ── Filter 3: sane velocity ─────────────────────────────────────────
+        chunk = chunk[chunk['release_speed'].between(50, 110)]
+
+        if len(chunk) == 0:
+            del chunk
+            continue
+
+        # ── hb sign fix (hand-dependent), same convention as before ────────
+        if 'p_throws' in chunk.columns:
+            chunk['hb'] = np.where(
+                chunk['p_throws'] == 'L',
+                chunk['pfx_x'] * 12,          # LHP: no flip
+                chunk['pfx_x'] * 12 * -1      # RHP: flip
+            )
+        else:
+            chunk['hb'] = chunk['pfx_x'] * 12 * -1
+        chunk['ivb'] = chunk['pfx_z'] * 12
+
+        # ── Accumulate hand mode counts across chunks ───────────────────────
+        if 'p_throws' in chunk.columns:
+            for pid, grp in chunk.groupby('pitcher'):
+                h = grp['p_throws'].mode()
+                if len(h):
+                    d = hand_counts.setdefault(int(pid), {})
+                    d[h.iloc[0]] = d.get(h.iloc[0], 0) + len(grp)
+
+        # ── Accumulate name map (first occurrence is fine — names don't change)
+        if 'player_name' in chunk.columns:
+            for pid, grp in chunk.groupby('pitcher'):
+                pid = int(pid)
+                if pid not in name_map:
+                    nm = grp['player_name'].iloc[0]
+                    if isinstance(nm, str) and ',' in nm:
+                        parts = nm.split(',', 1)
+                        nm = parts[1].strip() + ' ' + parts[0].strip()
+                    name_map[pid] = nm
+
+        # ── Accumulate team map — chunks are chronological, so later chunks
+        # correctly overwrite earlier ones, preserving "most recent team" ───
+        if 'home_team' in chunk.columns and 'inning_topbot' in chunk.columns:
+            chunk['_pitcher_team'] = np.where(
+                chunk['inning_topbot'] == 'Top',
+                chunk['home_team'],
+                chunk['away_team'] if 'away_team' in chunk.columns else chunk['home_team']
+            )
+            for pid, grp in chunk.groupby('pitcher'):
+                team_map[int(pid)] = grp['_pitcher_team'].iloc[-1]
+
+        # ── Roll this chunk up to small per-pitcher/pitch-type sums+counts —
+        # this is the only piece kept around per chunk, not the raw pitches ──
+        part = chunk.groupby(['pitcher','pitch_type']).agg(
+            n         = ('release_speed', 'count'),
+            velo_sum  = ('release_speed', 'sum'),
+            ivb_sum   = ('ivb', 'sum'),
+            hb_sum    = ('hb', 'sum'),
+            ext_sum   = ('release_extension', 'sum'),
+            relh_sum  = ('release_pos_z', 'sum'),
+            relx_sum  = ('release_pos_x', 'sum'),
+        ).reset_index()
+        partials.append(part)
+
+        # Free this chunk's full per-pitch table before pulling the next month
+        del chunk
+
+    if verbose:
+        print(f'  Raw rows across all chunks: {total_rows:,}')
+
+    if not partials:
+        raise ValueError('No Statcast data found for the given date range.')
+
+    # ── Combine chunk-level sums into full-range totals ───────────────────────
+    combined = pd.concat(partials, ignore_index=True)
+    del partials
+
+    totals = combined.groupby(['pitcher','pitch_type']).agg(
+        n        = ('n', 'sum'),
+        velo_sum = ('velo_sum', 'sum'),
+        ivb_sum  = ('ivb_sum', 'sum'),
+        hb_sum   = ('hb_sum', 'sum'),
+        ext_sum  = ('ext_sum', 'sum'),
+        relh_sum = ('relh_sum', 'sum'),
+        relx_sum = ('relx_sum', 'sum'),
     ).reset_index()
+    del combined
+
+    agg = pd.DataFrame({
+        'pitcher':          totals['pitcher'],
+        'pitch_type':       totals['pitch_type'],
+        'n':                totals['n'],
+        'velo':             totals['velo_sum'] / totals['n'],
+        'ivb':              totals['ivb_sum']  / totals['n'],
+        'hb':               totals['hb_sum']   / totals['n'],
+        'extension':        totals['ext_sum']  / totals['n'],
+        'release_height':   totals['relh_sum'] / totals['n'],
+        'release_side_raw': totals['relx_sum'] / totals['n'],
+    })
+    del totals
+
+    # ── Resolve hand map from accumulated per-chunk counts ────────────────────
+    hand_map = {pid: max(counts, key=counts.get) for pid, counts in hand_counts.items()}
 
     # ── Apply release_side correction ────────────────────────────────────────
     # Derived from diagnostic: correction = RS_A*ext + RS_B
