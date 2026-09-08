@@ -16,7 +16,8 @@ from matplotlib import font_manager
 _FONT_REG_PATH  = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans', weight='normal'))
 _FONT_BOLD_PATH = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans', weight='bold'))
 
-SCALE = 2  # render at 2x for crisp downloadable JPGs
+SCALE = 3  # supersample at 3x, then downsample to 1.5x at the end for crisp anti-aliased edges/text
+FINAL_SCALE = 1.5
 
 _font_cache = {}
 def F(size, bold=False):
@@ -171,8 +172,8 @@ def measure_pill_width(draw, name, val_text):
     dot_r = 4.5
     pad_l, pad_r = 9, 12
     gap = 6
-    nw = text_w(draw, name, F(12, True))
-    vw = text_w(draw, val_text, F(12))
+    nw = text_w(draw, name, F(12, True)) / SCALE
+    vw = text_w(draw, val_text, F(12)) / SCALE
     return pad_l + (dot_r * 2) + gap + nw + gap + vw + pad_r
 
 
@@ -180,8 +181,8 @@ def draw_pill(c, x, y, color, name, val_text):
     dot_r = 4.5
     pad_l, pad_r, pad_v = 9, 12, 5
     name_font, val_font = F(12, True), F(12)
-    nw = text_w(c.draw, name, name_font)
-    vw = text_w(c.draw, val_text, val_font)
+    nw = text_w(c.draw, name, name_font) / SCALE
+    vw = text_w(c.draw, val_text, val_font) / SCALE
     gap = 6
     content_w = (dot_r * 2) + gap + nw + gap + vw
     h = 22
@@ -206,9 +207,20 @@ def draw_legend_dot(c, x, y, color, text):
     return (r * 2 + 4) + text_w(c.draw, text, font) / SCALE
 
 
-def draw_scatter_plot(c, x, y, w, h, points, mode):
-    """mode: 'tunnel' uses tx/tz, 'plate' uses px/pz. Ported from PLOT_JS."""
-    rounded_rect(c.draw, [S(x), S(y), S(x + w), S(y + h)], S(0), fill=hex_rgb(BG_SOFT))
+def draw_scatter_plot(c, x, y, w, h, points, mode, plt_mult=0.65):
+    """mode: 'tunnel' uses tx/tz, 'plate' uses px/pz. Ported from PLOT_JS.
+
+    Drawn onto its own sub-image sized exactly (w, h) and pasted onto the
+    main canvas afterward. PIL's ImageDraw does not clip to any bounding
+    region the way an HTML <canvas> does automatically — without this, a
+    shape whose computed coordinates fall outside the intended plot area
+    (e.g. the fixed-size strike-zone box against a tightly clustered pitch
+    location) gets drawn wherever the math says, bleeding into whatever
+    section happens to sit below it on the card.
+    """
+    sub = Image.new('RGB', (S(w), S(h)), hex_rgb(BG_SOFT))
+    sd  = ImageDraw.Draw(sub)
+
     pad = 16 if mode == 'tunnel' else 10
     max_r = 24
     key_x = 'tx' if mode == 'tunnel' else 'px'
@@ -224,35 +236,49 @@ def draw_scatter_plot(c, x, y, w, h, points, mode):
         z_range = (z_max - z_min) + max_r * 2.5
         scale = min((w - 2 * pad) / x_range, (h - 2 * pad) / z_range)
     else:
-        eff_x = (x_max - x_min) / 0.35 if (x_max - x_min) else 1
-        eff_z = (z_max - z_min) / 0.35 if (z_max - z_min) else 1
+        # plt_mult mirrors the original: mult = round(0.35 + (pct/100)*0.65, 4)
+        # — a percentile-scaled zoom level, not a fixed constant.
+        eff_x = (x_max - x_min) / plt_mult if (x_max - x_min) else 1
+        eff_z = (z_max - z_min) / plt_mult if (z_max - z_min) else 1
         scale = min((w - 2 * pad) / eff_x, (h - 2 * pad) / eff_z) * 0.88
 
     x_mid, z_mid = (x_max + x_min) / 2, (z_max + z_min) / 2
 
     def to_canvas(px_, pz_):
-        cx = x + w / 2 + (px_ - x_mid) * scale
-        cy = y + h / 2 - (pz_ - z_mid) * scale
+        # coordinates relative to the sub-image's own (0,0), not the card
+        cx = w / 2 + (px_ - x_mid) * scale
+        cy = h / 2 - (pz_ - z_mid) * scale
         return cx, cy
 
     if mode == 'plate':
         tl = to_canvas(-8.5, 44)
         br = to_canvas(8.5, 18)
         if br[0] > tl[0] and br[1] > tl[1]:
-            c.draw.rectangle([S(tl[0]), S(tl[1]), S(br[0]), S(br[1])],
-                              outline=hex_rgb(STRIKE_ZONE), width=max(1, S(0.5)))
+            # clamp to the sub-image bounds — belt-and-suspenders alongside
+            # the paste-based clipping, in case of extreme data
+            rx0 = max(0, min(tl[0], w))
+            ry0 = max(0, min(tl[1], h))
+            rx1 = max(0, min(br[0], w))
+            ry1 = max(0, min(br[1], h))
+            if rx1 > rx0 and ry1 > ry0:
+                sd.rectangle([S(rx0), S(ry0), S(rx1), S(ry1)],
+                             outline=hex_rgb(STRIKE_ZONE), width=max(1, S(0.5)))
 
     for p in points:
         cx, cy = to_canvas(p[key_x], p[key_z])
         r = max(12, min(max_r, p['frac'] * 0.62)) if mode == 'tunnel' else max(14, min(22, p['frac'] * 0.50))
         col = hex_rgb(p['c'])
-        c.draw.ellipse([S(cx - r), S(cy - r), S(cx + r), S(cy + r)], fill=col, outline=hex_rgb(p['c']), width=S(1.2))
+        sd.ellipse([S(cx - r), S(cy - r), S(cx + r), S(cy + r)], fill=col, outline=hex_rgb(p['c']), width=S(1.2))
         f = F(max(9, min(12, r)), True)
-        draw_text(c.draw, (S(cx), S(cy)), p['t'], f, (255, 255, 255), anchor='mm')
+        draw_text(sd, (S(cx), S(cy)), p['t'], f, (255, 255, 255), anchor='mm')
 
     fnote = F(9)
-    draw_text(c.draw, (S(x + pad + 2), S(y + h - 4)), '\u2190 glove', fnote, hex_rgb(PLOT_LABEL), anchor='ls')
-    draw_text(c.draw, (S(x + w - pad - 2), S(y + h - 4)), 'arm \u2192', fnote, hex_rgb(PLOT_LABEL), anchor='rs')
+    draw_text(sd, (S(pad + 2), S(h - 4)), '\u2190 glove', fnote, hex_rgb(PLOT_LABEL), anchor='ls')
+    draw_text(sd, (S(w - pad - 2), S(h - 4)), 'arm \u2192', fnote, hex_rgb(PLOT_LABEL), anchor='rs')
+
+    # Paste the finished sub-plot onto the main canvas — this is what actually
+    # clips anything drawn outside (0,0)-(w,h) above, fixing the overflow bug.
+    c.img.paste(sub, (S(x), S(y)))
 
 
 def draw_bar(c, x, y, w, h, pct_val, color):
@@ -368,8 +394,9 @@ def render_pitcher_card(info, team_full, hand_str, watermark='By Robert Colonna'
     draw_text(c.draw, (S(body_x + plot_w + plot_w / 2), S(box_y + 8)), 'AT THE PLATE \u2014 PITCHES DIVERGE',
                title_font, hex_rgb('#888888'), anchor='ma')
     plots_top = box_y + 20
+    plt_mult = round(0.35 + (pct / 100) * 0.65, 4)
     draw_scatter_plot(c, body_x, plots_top, plot_w, plot_h - 20, P, 'tunnel')
-    draw_scatter_plot(c, body_x + plot_w, plots_top, plot_w, plot_h - 20, P, 'plate')
+    draw_scatter_plot(c, body_x + plot_w, plots_top, plot_w, plot_h - 20, P, 'plate', plt_mult=plt_mult)
     c.y = box_y + plot_h + 4
     c.ensure_height(20)
     leg_x = body_x
@@ -498,6 +525,15 @@ def render_pitcher_card(info, team_full, hand_str, watermark='By Robert Colonna'
 
     bg = Image.new('RGB', final.size, hex_rgb('#f0f0f0'))
     bg.paste(final, (0, 0), mask)
+
+    # ── Downsample from the 3x supersampled draw to 1.5x final resolution.
+    # PIL's font/shape anti-aliasing looks noticeably softer than a browser's
+    # hinted text rendering at 1:1; drawing everything larger and downsampling
+    # with a high-quality filter sharpens edges the same way a 2x screenshot
+    # scaled down looks crisper than one rendered at native size. ──────────────
+    target_w = round(bg.width * (FINAL_SCALE / SCALE))
+    target_h = round(bg.height * (FINAL_SCALE / SCALE))
+    bg = bg.resize((target_w, target_h), Image.LANCZOS)
 
     buf = io.BytesIO()
     bg.save(buf, format='JPEG', quality=95)
