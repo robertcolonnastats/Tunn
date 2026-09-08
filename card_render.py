@@ -389,7 +389,7 @@ def render_pitcher_card(info, team_full, hand_str):
     # my earlier port used a ~110px-tall canvas, well under half that, which
     # crushed the plate-view points together far more than intended.
     plot_w = (content_w - 1) / 2
-    canvas_h = 215
+    canvas_h = 315
     title_h = 20
     bottom_pad = 8
     box_h = title_h + canvas_h + bottom_pad
