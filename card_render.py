@@ -385,28 +385,34 @@ def render_pitcher_card(info, team_full, hand_str):
 
     # Pitch location plots
     section_label("Pitch location \u2014 catcher's view")
+    # The original HTML used fixed <canvas width="310" height="215"> elements —
+    # my earlier port used a ~110px-tall canvas, well under half that, which
+    # crushed the plate-view points together far more than intended.
     plot_w = (content_w - 1) / 2
-    plot_h = 130
+    canvas_h = 215
+    title_h = 20
+    bottom_pad = 8
+    box_h = title_h + canvas_h + bottom_pad
     box_y = c.y
-    rounded_rect(c.draw, [S(body_x), S(box_y), S(body_x + content_w), S(box_y + plot_h + 24)], S(8),
+    rounded_rect(c.draw, [S(body_x), S(box_y), S(body_x + content_w), S(box_y + box_h)], S(8),
                  outline=hex_rgb(BORDER_LT), width=S(0.5))
     title_font = F(11, True)
     draw_text(c.draw, (S(body_x + plot_w / 2), S(box_y + 8)), 'AT TUNNEL POINT \u00b7 23.8FT \u2014 PITCHES CONVERGE',
                title_font, hex_rgb('#888888'), anchor='ma')
     draw_text(c.draw, (S(body_x + plot_w + plot_w / 2), S(box_y + 8)), 'AT THE PLATE \u2014 PITCHES DIVERGE',
                title_font, hex_rgb('#888888'), anchor='ma')
-    plots_top = box_y + 20
+    plots_top = box_y + title_h
     plt_mult = round(0.35 + (pct / 100) * 0.65, 4)
-    draw_scatter_plot(c, body_x, plots_top, plot_w, plot_h - 20, P, 'tunnel')
-    draw_scatter_plot(c, body_x + plot_w, plots_top, plot_w, plot_h - 20, P, 'plate', plt_mult=plt_mult)
-    c.y = box_y + plot_h + 4
+    draw_scatter_plot(c, body_x, plots_top, plot_w, canvas_h, P, 'tunnel')
+    draw_scatter_plot(c, body_x + plot_w, plots_top, plot_w, canvas_h, P, 'plate', plt_mult=plt_mult)
+    c.y = box_y + box_h - bottom_pad
     c.ensure_height(20)
     leg_x = body_x
     leg_y = c.y + 10
     for p in P:
         w_used = draw_legend_dot(c, leg_x, leg_y, p['c'], f"{p['t']} IVB {'+' if p['ivb'] >= 0 else ''}{p['ivb']}\"")
         leg_x += w_used + 10
-    c.y = box_y + plot_h + 24 + 12
+    c.y = box_y + box_h + 12
     divider()
 
     # Tunnel pairs
