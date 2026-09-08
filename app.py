@@ -17,6 +17,21 @@ import tempfile
 from datetime import date, datetime, timezone, timedelta
 from itertools import combinations
 
+import threading
+import urllib.request
+
+def _keep_alive():
+    """Ping this app every 4 hours to prevent sleep."""
+    import time
+    while True:
+        time.sleep(4 * 60 * 60)  # 4 hours
+        try:
+            urllib.request.urlopen("https://YOUR-APP-URL.streamlit.app", timeout=10)
+        except Exception:
+            pass  # Silently ignore any errors
+
+_t = threading.Thread(target=_keep_alive, daemon=True)
+_t.start()
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Set Playwright browser path before any playwright import ──────────────────
@@ -262,6 +277,8 @@ def get_league_pools(start: str, end: str):
         _, pools_df = store[key]
     else:
         _, pools_df = load_season_data(start, end)
+    if pools_df is None:
+        return {'ratios': [], 'temporal': [], 'tr_pp': [], 'rc_pp': [], 'tm_pp': []}
     return build_league_pools(pools_df)
 
 
@@ -845,7 +862,7 @@ with st.sidebar:
     with col_d1:
         start_date = st.date_input(
             'From',
-            value=date(season, 3, 27),
+            value=date.today() - timedelta(days=7),
             min_value=date(2021, 1, 1),
             max_value=date.today(),
         )
@@ -871,20 +888,13 @@ with st.sidebar:
         st.rerun()
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-# NOTE: _load_season_data_direct is the raw function used by the background
-# thread. st.cache_data decorators cannot be called from non-Streamlit threads
-# (they try to access ScriptRunContext and fail). The thread calls this directly;
-# the result is stored in sys.modules and the main thread reads it from there.
-def _load_season_data_direct(start: str, end: str):
-    df_raw = load_statcast(start, end, verbose=False)
-    c, f   = run_model(df_raw)
-    q      = normalize(c, f)
-    return q, df_raw
-
-# Cached wrapper for calls made from the main Streamlit thread (e.g. rerenders)
-@st.cache_data(ttl=21600, show_spinner=False)
-def load_season_data(start: str, end: str):
-    return _load_season_data_direct(start, end)
+# NOTE: _load_season_data_direct (defined earlier, ~line 673) is the raw function
+# used by the background thread. st.cache_data decorators cannot be called from
+# non-Streamlit threads (they try to access ScriptRunContext and fail). The thread
+# calls it directly; the result is stored in sys.modules and the main thread reads
+# it from there. Do NOT redefine _load_season_data_direct/load_season_data here —
+# a duplicate definition previously shadowed the original and made it return
+# `None` instead of `pools`, which broke every pitcher_id-keyed lookup downstream.
 
 # Use sys.modules to store results — truly process-global, survives reruns.
 import threading, time as _time, sys as _sys
@@ -958,12 +968,22 @@ if _cache_key not in _tplus_store:
     _time.sleep(2)
     st.rerun()
 
+# If the background thread never populated the cache, fall back to a direct
+# load in the main thread so the app does not crash on a cold start.
+if _cache_key not in _tplus_store and _err_key not in _tplus_store:
+    try:
+        _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
+    except Exception as exc:
+        _tplus_store[_err_key] = exc
+
 if _err_key in _tplus_store:
     st.error(f'Failed to load data: {_tplus_store[_err_key]}')
     st.exception(_tplus_store[_err_key])
     st.stop()
 
 lb, pools = _tplus_store[_cache_key]
+if pools is None:
+    pools = pd.DataFrame()
 
 # Filter and rerank
 lb_filtered = lb[lb['pitches'] >= min_pitches].copy()
@@ -1068,7 +1088,7 @@ with tab1:
     disp = display[show_cols].rename(columns=col_names)
     st.dataframe(
         disp,
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
         column_config={
             'Rank':      st.column_config.NumberColumn(width='small'),
@@ -1112,7 +1132,7 @@ with tab2:
     playwright_ok = True
     try:
         from playwright.async_api import async_playwright  # noqa
-    except ImportError:
+    except Exception:
         playwright_ok = False
 
     if selected:
@@ -1136,7 +1156,7 @@ with tab2:
                 adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
                                           'ivb':'IVB','hb':'HB','frac':'Usage%'})
                 cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
-                st.dataframe(adf[cols], width="stretch", hide_index=True)
+                st.dataframe(adf[cols], use_container_width=True, hide_index=True)
         else:
             with st.spinner(f'Rendering card for {selected}…'):
                 try:
@@ -1146,15 +1166,36 @@ with tab2:
                         st.error(f'No pitch-level data found for {selected}.')
                     else:
                         html      = make_card_html(info)
-                        jpg_bytes = render_card(html)
-                        st.image(jpg_bytes, width=720)
-                        slug = selected.lower().replace(' ', '_').replace('.', '')
-                        st.download_button(
-                            label='⬇️ Download card JPG',
-                            data=jpg_bytes,
-                            file_name=f'{slug}_tunneling_card.jpg',
-                            mime='image/jpeg'
-                        )
+                        try:
+                            jpg_bytes = render_card(html)
+                            st.image(jpg_bytes, width=720)
+                            slug = selected.lower().replace(' ', '_').replace('.', '')
+                            st.download_button(
+                                label='⬇️ Download card JPG',
+                                data=jpg_bytes,
+                                file_name=f'{slug}_tunneling_card.jpg',
+                                mime='image/jpeg'
+                            )
+                        except Exception as render_err:
+                            st.warning(
+                                'Card rendering failed, showing text-only view instead. '
+                                f'{render_err}'
+                            )
+                            # Fall back to the same text card summary.
+                            tp  = lb_row['tunneling_plus']
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric('T+', f'{tp:.1f}')
+                            c2.metric('Percentile', f'{int(lb_row["tp_pct"])}th')
+                            c3.metric('Tunnel Pairs', int(lb_row['n_tunnel_pairs']))
+                            c4.metric('Avg Ratio', f'{lb_row["avg_tunnel_ratio"]:.3f}x')
+                            details = lb_row.get('pitch_details', [])
+                            if isinstance(details, str): details = json.loads(details)
+                            if details:
+                                adf = pd.DataFrame(sorted(details, key=lambda x: -x['frac']))
+                                adf = adf.rename(columns={'type':'Pitch','pitches':'N','velo':'Velo',
+                                                          'ivb':'IVB','hb':'HB','frac':'Usage%'})
+                                cols = [c for c in ['Pitch','N','Usage%','Velo','IVB','HB'] if c in adf.columns]
+                                st.dataframe(adf[cols], use_container_width=True, hide_index=True)
                 except Exception as e:
                     st.error(f'Card render failed: {e}')
                     st.exception(e)
@@ -1205,7 +1246,7 @@ with tab4:
         except Exception:
             pass
 
-    st.dataframe(diag_df.round(4), width="stretch", hide_index=True)
+    st.dataframe(diag_df.round(4), use_container_width=True, hide_index=True)
 
     csv_bytes = diag_df.round(4).to_csv(index=False).encode()
     st.download_button(
@@ -1495,7 +1536,7 @@ with tab6:
                                         cname: f"{c_mix[idx]*100:.1f}%",
                                     })
                                 mix_df = pd.DataFrame(mix_data)
-                                st.dataframe(mix_df, hide_index=True, width="content")
+                                st.dataframe(mix_df, hide_index=True)
 
                             # Metric comparison
                             st.markdown("**Metric Comparison**")
@@ -1517,7 +1558,7 @@ with tab6:
                                     cname: f'{c_val:{fmt}}',
                                 })
                             met_df = pd.DataFrame(met_data)
-                            st.dataframe(met_df, hide_index=True, width="content")
+                            st.dataframe(met_df, hide_index=True)
 
                             if st.button(f"Open {cname}'s Player Card", key=f'comp_nav_{rank_i}_{cname}'):
                                 st.session_state['selected_pitcher'] = cname
@@ -1775,4 +1816,3 @@ with tab7:
                     st.caption(f"🟠 {hl_pitcher} &nbsp;·&nbsp; Trendline shows league average relationship")
                 else:
                     st.caption("🔵 LHP &nbsp;·&nbsp; 🟢 RHP &nbsp;·&nbsp; Hover for details")
-
