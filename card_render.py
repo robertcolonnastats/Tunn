@@ -16,8 +16,8 @@ from matplotlib import font_manager
 _FONT_REG_PATH  = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans', weight='normal'))
 _FONT_BOLD_PATH = font_manager.findfont(font_manager.FontProperties(family='DejaVu Sans', weight='bold'))
 
-SCALE = 3  # supersample at 3x, then downsample to 1.5x at the end for crisp anti-aliased edges/text
-FINAL_SCALE = 1.5
+SCALE = 4  # supersample at 4x, then downsample to 2x at the end for crisp anti-aliased edges/text
+FINAL_SCALE = 2
 
 _font_cache = {}
 def F(size, bold=False):
@@ -288,7 +288,7 @@ def draw_bar(c, x, y, w, h, pct_val, color):
 
 
 # ── Team full names + hand strings (must match app.py's tables) ─────────────
-def render_pitcher_card(info, team_full, hand_str, watermark='By Robert Colonna'):
+def render_pitcher_card(info, team_full, hand_str):
     """
     Draws the full Tunneling+ player card and returns JPEG bytes.
     `info` is the exact dict produced by get_pitcher_card_info() in app.py.
@@ -300,8 +300,10 @@ def render_pitcher_card(info, team_full, hand_str, watermark='By Robert Colonna'
     pct = info['tp_pct']
 
     # ── Header ────────────────────────────────────────────────────────────────
+    # Height matches the original card exactly (measured at 163 CSS px) — no
+    # watermark line, which the current live design doesn't include.
     hdr_top_y = c.y
-    hdr_h = 148
+    hdr_h = 163
     c.advance(hdr_h)
     rounded_rect(c.draw, [0, S(hdr_top_y), c.w, S(hdr_top_y + hdr_h)], 0, fill=hex_rgb(NAVY))
 
@@ -323,24 +325,24 @@ def render_pitcher_card(info, team_full, hand_str, watermark='By Robert Colonna'
     draw_text(c.draw, (S(pbx + pct_box_w / 2), S(pby + 10)), f'{pct}th', F(20), (255, 255, 255), anchor='ma')
     draw_text(c.draw, (S(pbx + pct_box_w / 2), S(pby + 32)), 'percentile', F(11), hex_rgb(NAVY_MUTED_2), anchor='ma')
 
-    center_y = hdr_top_y + PAD_V + 32
+    center_y = hdr_top_y + PAD_V + 34
     tp_str = f"{info['tplus']:.1f}" if isinstance(info['tplus'], float) else str(info['tplus'])
     draw_text(c.draw, (S(CARD_W / 2), S(center_y)), tp_str, F(38), hex_rgb(BLUE_ACCENT), anchor='ma')
     draw_text(c.draw, (S(CARD_W / 2), S(center_y + 46)), 'TUNNELING+', F(11), hex_rgb(NAVY_MUTED_2), anchor='ma')
     total_str = f" of {info['total']}" if info.get('total') else ''
-    draw_text(c.draw, (S(CARD_W / 2), S(center_y + 64)), f"Rank #{info['rank']}{total_str} qualified pitchers",
+    draw_text(c.draw, (S(CARD_W / 2), S(center_y + 66)), f"Rank #{info['rank']}{total_str} qualified pitchers",
                F(12), hex_rgb(NAVY_MUTED_2), anchor='ma')
-
-    draw_text(c.draw, (S(CARD_W - PAD_H), S(hdr_top_y + hdr_h - 18)), watermark,
-               F(10), hex_rgb(NAVY_MUTED_3), anchor='ra')
 
     # ── Body ──────────────────────────────────────────────────────────────────
     body_x = PAD_H
     content_w = CARD_W - 2 * PAD_H
     c.advance(16)  # body top padding
 
-    def section_label(text):
+    def section_label(text, subtitle=None):
         draw_text(c.draw, (S(body_x), S(c.y)), text.upper(), F(12, True), hex_rgb('#888888'))
+        if subtitle:
+            main_w = text_w(c.draw, text.upper(), F(12, True)) / SCALE
+            draw_text(c.draw, (S(body_x + main_w + 6), S(c.y + 1)), subtitle, F(11), hex_rgb('#aaaaaa'))
         c.advance(20)
 
     def divider():
@@ -411,7 +413,8 @@ def render_pitcher_card(info, team_full, hand_str, watermark='By Robert Colonna'
     tp = info['tp_top3']
     top_n = min(3, len(tp))
     if top_n > 0:
-        section_label(f"Top {top_n} tunnel pair{'s' if top_n > 1 else ''}")
+        section_label(f"Top {top_n} tunnel pair{'s' if top_n > 1 else ''}",
+                       subtitle=f"\u2014 best of {info['n_tp_total']} qualifying. Bar = percentile vs all MLB tunnel pairs.")
         n_cols = 3 if top_n == 3 else 2
         pair_gap = 8
         pair_w = (content_w - (n_cols - 1) * pair_gap) / n_cols
