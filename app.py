@@ -862,7 +862,7 @@ with st.sidebar:
     with col_d1:
         start_date = st.date_input(
             'From',
-            value=date.today() - timedelta(days=30),
+            value=date.today() - timedelta(days=7),
             min_value=date(2021, 1, 1),
             max_value=date.today(),
         )
