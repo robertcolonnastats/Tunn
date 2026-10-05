@@ -17,18 +17,6 @@ from itertools import combinations
 import threading
 import urllib.request
 
-def _keep_alive():
-    """Ping this app every 4 hours to prevent sleep."""
-    import time
-    while True:
-        time.sleep(4 * 60 * 60)  # 4 hours
-        try:
-            urllib.request.urlopen("https://YOUR-APP-URL.streamlit.app", timeout=10)
-        except Exception:
-            pass  # Silently ignore any errors
-
-_t = threading.Thread(target=_keep_alive, daemon=True)
-_t.start()
 sys.path.insert(0, os.path.dirname(__file__))
 
 # ── Import V18 pipeline ───────────────────────────────────────────────────────
@@ -118,7 +106,7 @@ def get_league_pools(start: str, end: str):
     if key in store:
         _, pools_df = store[key]
     else:
-        _, pools_df = load_season_data(start, end)
+        pools_df = None
     if pools_df is None:
         return {'ratios': [], 'temporal': [], 'tr_pp': [], 'rc_pp': [], 'tm_pp': []}
     return build_league_pools(pools_df)
@@ -508,10 +496,18 @@ with st.sidebar:
     st.markdown('---')
     if st.button('🔄 Force Refresh'):
         import sys as _sys2
-        if '__tplus_data_store__' in _sys2.modules:
-            _sys2.modules['__tplus_data_store__'].clear()
-        st.cache_data.clear()
-        st.rerun()
+        _st2 = _sys2.modules.get('__tplus_data_store__')
+        if _st2 is not None:
+            _lk2 = _st2.get('_lock')
+            _loading2 = any(k.startswith('thread_') and v.is_alive()
+                            for k, v in list(_st2.items()) if hasattr(v, 'is_alive'))
+            if _loading2:
+                st.warning('A data load is already running; please wait.')
+            else:
+                for _k2 in [k for k in list(_st2.keys()) if k != '_lock']:
+                    _st2.pop(_k2, None)
+                st.cache_data.clear()
+                st.rerun()
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 # NOTE: _load_season_data_direct (defined earlier, ~line 673) is the raw function
@@ -527,85 +523,94 @@ import threading, time as _time, sys as _sys
 
 _STORE_KEY = '__tplus_data_store__'
 if _STORE_KEY not in _sys.modules:
-    _sys.modules[_STORE_KEY] = {}
+    _sys.modules[_STORE_KEY] = {'_lock': threading.RLock()}
 _tplus_store = _sys.modules[_STORE_KEY]
+if '_lock' not in _tplus_store:
+    _tplus_store['_lock'] = threading.RLock()
+_store_lock = _tplus_store['_lock']
 
 _cache_key  = f'data_{start_str}_{end_str}'
 _err_key    = f'err_{start_str}_{end_str}'
 _thread_key = f'thread_{start_str}_{end_str}'
 _t0_key     = f't0_{start_str}_{end_str}'
+_MAX_RANGES = 2   # keep at most this many date ranges in memory (OOM guard)
 
-# Evict stale seasons immediately to prevent OOM
-for _stale_key in [k for k in list(_tplus_store.keys())
-                   if k.startswith('data_') and k != _cache_key]:
-    del _tplus_store[_stale_key]
-for _stale_k in [k for k in list(_tplus_store.keys())
-                 if (k.startswith('thread_') or k.startswith('err_') or k.startswith('t0_'))
-                 and not k.endswith(f'_{start_str}_{end_str}')]:
-    _tplus_store.pop(_stale_k, None)
+def _clear_range_keys():
+    for _k in [_cache_key, _err_key, _thread_key, _t0_key,
+               f'rc_{_cache_key}', f'mix_{_cache_key}']:
+        _tplus_store.pop(_k, None)
 
-# Start background thread if result not yet available and no thread running
+def _evict_old_ranges():
+    """Keep only the most recently used ranges. Never evicts a range that is loading."""
+    _used = _tplus_store.setdefault('_lru', [])
+    if _cache_key in _used:
+        _used.remove(_cache_key)
+    _used.append(_cache_key)
+    while len(_used) > _MAX_RANGES:
+        _old = _used.pop(0)
+        _suffix = _old[len('data_'):]
+        for _p in ('data_', 'err_', 'thread_', 't0_', 'rc_data_', 'mix_data_'):
+            _tplus_store.pop(_p + _suffix, None)
+        for _ck in [k for k in list(_tplus_store.keys()) if k.startswith('card_') and _suffix in k]:
+            _tplus_store.pop(_ck, None)
+
+# Start ONE background loader per range. The lock makes check-then-start atomic,
+# so concurrent sessions can never launch duplicate (memory-heavy) loads.
+with _store_lock:
+    if _cache_key not in _tplus_store:
+        _existing_thread = _tplus_store.get(_thread_key)
+        _thread_running  = _existing_thread is not None and _existing_thread.is_alive()
+        _any_loading = any(k.startswith('thread_') and hasattr(v, 'is_alive') and v.is_alive()
+                           for k, v in list(_tplus_store.items()))
+        if not _thread_running and not _any_loading and _err_key not in _tplus_store:
+            def _load_in_background(_ck=_cache_key, _ek=_err_key, _s=start_str, _e=end_str):
+                try:
+                    _tplus_store[_ck] = _load_season_data_direct(_s, _e)
+                except BaseException as exc:
+                    _tplus_store[_ek] = exc
+                finally:
+                    import gc as _gc
+                    _gc.collect()
+
+            _t = threading.Thread(target=_load_in_background, daemon=True)
+            _tplus_store[_thread_key] = _t
+            _tplus_store[_t0_key]     = _time.time()
+            _t.start()
+    _evict_old_ranges()
+
+# Poll: show status and rerun (cheap; no data work happens while loading)
 if _cache_key not in _tplus_store:
-    _existing_thread = _tplus_store.get(_thread_key)
-    _thread_running  = _existing_thread is not None and _existing_thread.is_alive()
-    if not _thread_running and _err_key not in _tplus_store:
-        def _load_in_background():
-            try:
-                _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
-            except Exception as exc:
-                _tplus_store[_err_key] = exc
-
-        _t = threading.Thread(target=_load_in_background, daemon=True)
-        _tplus_store[_thread_key] = _t
-        _tplus_store[_t0_key]     = _time.time()
-        _t.start()
-
-# Poll: show status and rerun
-if _cache_key not in _tplus_store:
-    _thread_done = (
+    _thread_alive = (
         _tplus_store.get(_thread_key) is not None
-        and not _tplus_store[_thread_key].is_alive()
+        and _tplus_store[_thread_key].is_alive()
     )
     _elapsed = int(_time.time() - _tplus_store.get(_t0_key, _time.time()))
     if _err_key in _tplus_store:
         _err = _tplus_store[_err_key]
         st.error(f'Failed to load data: {_err}')
-        st.exception(_err)
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
+        if st.button('🔄 Retry', key='retry_err'):
+            _clear_range_keys()
             st.rerun()
         st.stop()
-    if _elapsed > 480:
-        st.error(f'Data load timed out after {_elapsed}s.')
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
+    if _thread_key in _tplus_store and not _thread_alive:
+        st.error('Load thread finished without a result.')
+        if st.button('🔄 Retry', key='retry_dead'):
+            _clear_range_keys()
             st.rerun()
         st.stop()
-    if _thread_done:
-        st.error(f'Load thread finished without result. Keys: {list(_tplus_store.keys())}')
-        if st.button('🔄 Retry'):
-            for _k in [_cache_key, _err_key, _thread_key, _t0_key]:
-                _tplus_store.pop(_k, None)
-            st.rerun()
-        st.stop()
-    st.info(f'⏳ Loading Statcast data... ({_elapsed}s — full season pull takes 2–3 min)')
-    _time.sleep(2)
+    if _thread_key not in _tplus_store:
+        # Another range is loading; wait for it instead of starting a second load.
+        st.info('⏳ Another data load is in progress. This page will update automatically.')
+    else:
+        if _elapsed > 900:
+            st.error(f'Data load timed out after {_elapsed}s.')
+            if st.button('🔄 Retry', key='retry_to'):
+                _clear_range_keys()
+                st.rerun()
+            st.stop()
+        st.info(f'⏳ Loading Statcast data... ({_elapsed}s, full season pull takes several minutes)')
+    _time.sleep(3)
     st.rerun()
-
-# If the background thread never populated the cache, fall back to a direct
-# load in the main thread so the app does not crash on a cold start.
-if _cache_key not in _tplus_store and _err_key not in _tplus_store:
-    try:
-        _tplus_store[_cache_key] = _load_season_data_direct(start_str, end_str)
-    except Exception as exc:
-        _tplus_store[_err_key] = exc
-
-if _err_key in _tplus_store:
-    st.error(f'Failed to load data: {_tplus_store[_err_key]}')
-    st.exception(_tplus_store[_err_key])
-    st.stop()
 
 lb, pools = _tplus_store[_cache_key]
 if pools is None:
@@ -657,7 +662,10 @@ def _compute_rc(pools_df, pitcher_ids):
             rc_map[pid] = sum(x[0]*x[1] for x in rc_w) / tw
     return rc_map
 
-_rc_map = _compute_rc(pools, set(lb_filtered['pitcher_id'].tolist()))
+_rc_key = f'rc_{_cache_key}'
+if _rc_key not in _tplus_store:
+    _tplus_store[_rc_key] = _compute_rc(pools, set(lb['pitcher_id'].tolist()))
+_rc_map = _tplus_store[_rc_key]
 lb_filtered['rc_val'] = lb_filtered['pitcher_id'].map(_rc_map)
 lb_filtered['rc_pct'] = (
     lb_filtered['rc_val'].rank(pct=True, ascending=False)
@@ -766,7 +774,14 @@ with tab2:
                     st.error(f'No pitch-level data found for {selected}.')
                 else:
                     try:
-                        jpg_bytes = render_pitcher_card(info, TEAM_FULL, HAND_STR)
+                        _card_key = f'card_{selected}_{_cache_key}_{min_pitches}'
+                        jpg_bytes = _tplus_store.get(_card_key)
+                        if jpg_bytes is None:
+                            jpg_bytes = render_pitcher_card(info, TEAM_FULL, HAND_STR)
+                            _cards = [k for k in _tplus_store if str(k).startswith('card_')]
+                            if len(_cards) >= 40:
+                                _tplus_store.pop(_cards[0], None)
+                            _tplus_store[_card_key] = jpg_bytes
                         st.image(jpg_bytes, width=720)
                         slug = selected.lower().replace(' ', '_').replace('.', '')
                         st.download_button(
@@ -1021,17 +1036,21 @@ with tab6:
 
         ALL_TYPES = ['FF', 'SI', 'FC', 'SL', 'ST', 'CU', 'KC', 'CH', 'FS', 'KN', 'EP', 'SC']
 
+        _mix_key = f'mix_{_cache_key}'
+        if _mix_key not in _tplus_store:
+            _mm = {}
+            _p10 = pools[pools['pitches'] >= 10]
+            for _nm, _g in _p10.groupby('pitcher_name'):
+                _tot = _g['pitches'].sum()
+                if _tot == 0:
+                    continue
+                _by = _g.groupby('pitch_type')['pitches'].sum()
+                _mm[_nm] = np.array([float(_by.get(pt, 0.0)) / _tot for pt in ALL_TYPES])
+            _tplus_store[_mix_key] = _mm
+        _mix_map = _tplus_store[_mix_key]
+
         def _pitch_mix_vec(pitcher_name):
-            rows = pools[pools['pitcher_name'] == pitcher_name]
-            rows = rows[rows['pitches'] >= 10]
-            total = rows['pitches'].sum()
-            if total == 0:
-                return None
-            vec = []
-            for pt in ALL_TYPES:
-                match = rows[rows['pitch_type'] == pt]
-                vec.append(float(match['pitches'].sum()) / total if len(match) > 0 else 0.0)
-            return np.array(vec)
+            return _mix_map.get(pitcher_name)
 
         def _cosine_sim(a, b):
             na, nb = np.linalg.norm(a), np.linalg.norm(b)
